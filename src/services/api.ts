@@ -213,4 +213,39 @@ export async function fetchWorkspaceActivity(dirPath: string): Promise<ActivityL
   }
 }
 
+export async function fetchDirectories(dirPath?: string): Promise<{
+  success: boolean;
+  currentPath: string;
+  parentPath: string | null;
+  homePath: string;
+  directories: {
+    name: string;
+    path: string;
+    hasIdeSession: boolean;
+    subItemCount: number;
+  }[];
+  hasIdeSession: boolean;
+}> {
+  const url = dirPath
+    ? `${API_BASE}/filesystem/directories?path=${encodeURIComponent(dirPath)}`
+    : `${API_BASE}/filesystem/directories`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('Failed to fetch directories');
+  return res.json();
+}
+
+export async function createDirectory(parentPath: string, folderName: string): Promise<{
+  success: boolean;
+  path: string;
+  name: string;
+}> {
+  const res = await fetch(`${API_BASE}/filesystem/create-directory`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ parentPath, folderName }),
+  });
+  if (!res.ok) throw new Error('Failed to create folder');
+  return res.json();
+}
+
 

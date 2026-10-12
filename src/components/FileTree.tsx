@@ -24,6 +24,7 @@ interface Props {
   onDeleteItem: (targetPath: string) => void;
   onRenameItem: (targetPath: string) => void;
   onRefresh: () => void;
+  onSwitchWorkspace?: () => void;
   currentRoot: string;
   width?: number;
 }
@@ -147,6 +148,7 @@ export const FileTree: React.FC<Props> = ({
   onDeleteItem,
   onRenameItem,
   onRefresh,
+  onSwitchWorkspace,
   currentRoot,
   width,
 }) => {
@@ -174,6 +176,15 @@ export const FileTree: React.FC<Props> = ({
           >
             <Folder size={14} />
           </button>
+          {onSwitchWorkspace && (
+            <button
+              className="icon-btn"
+              title="Switch Workspace Folder"
+              onClick={onSwitchWorkspace}
+            >
+              <FolderOpen size={14} color="var(--accent-cyan)" />
+            </button>
+          )}
           <button className="icon-btn" title="Refresh Tree" onClick={onRefresh}>
             <RefreshCw size={14} />
           </button>

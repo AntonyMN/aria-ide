@@ -277,6 +277,88 @@ function buildFileTree(dirPath, currentDepth = 0, maxDepth = 4) {
   });
 }
 
+// Browse filesystem directories for the workspace picker modal
+app.get('/api/filesystem/directories', (req, res) => {
+  const homeDir = os.homedir();
+  let targetPath = req.query.path ? String(req.query.path) : homeDir;
+
+  try {
+    if (!fs.existsSync(targetPath)) {
+      targetPath = homeDir;
+    }
+    const stat = fs.statSync(targetPath);
+    if (!stat.isDirectory()) {
+      targetPath = path.dirname(targetPath);
+    }
+
+    const entries = fs.readdirSync(targetPath, { withFileTypes: true });
+    const directories = [];
+
+    for (const entry of entries) {
+      if (entry.name.startsWith('.') && entry.name !== '.ide') continue;
+      if (['node_modules', 'dist', 'target', '.cache', '.npm', '.local'].includes(entry.name)) continue;
+
+      if (entry.isDirectory()) {
+        const fullDir = path.join(targetPath, entry.name);
+        const hasIde = fs.existsSync(path.join(fullDir, '.ide', 'session.json'));
+        let subCount = 0;
+        try {
+          subCount = fs.readdirSync(fullDir).length;
+        } catch (e) {}
+
+        directories.push({
+          name: entry.name,
+          path: fullDir,
+          hasIdeSession: hasIde,
+          subItemCount: subCount,
+        });
+      }
+    }
+
+    directories.sort((a, b) => {
+      if (a.hasIdeSession && !b.hasIdeSession) return -1;
+      if (!a.hasIdeSession && b.hasIdeSession) return 1;
+      return a.name.localeCompare(b.name);
+    });
+
+    const parentPath = path.dirname(targetPath) !== targetPath ? path.dirname(targetPath) : null;
+
+    res.json({
+      success: true,
+      currentPath: targetPath,
+      parentPath,
+      homePath: homeDir,
+      directories,
+      hasIdeSession: fs.existsSync(path.join(targetPath, '.ide', 'session.json')),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Create new folder via workspace picker
+app.post('/api/filesystem/create-directory', (req, res) => {
+  const { parentPath, folderName } = req.body;
+  if (!parentPath || !folderName) {
+    return res.status(400).json({ error: 'parentPath and folderName are required' });
+  }
+
+  const cleanName = folderName.trim().replace(/[\\/:*?"<>|]/g, '');
+  if (!cleanName) {
+    return res.status(400).json({ error: 'Invalid directory name' });
+  }
+
+  const newPath = path.join(parentPath, cleanName);
+  try {
+    if (!fs.existsSync(newPath)) {
+      fs.mkdirSync(newPath, { recursive: true });
+    }
+    res.json({ success: true, path: newPath, name: cleanName });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Get workspace file tree
 app.get('/api/workspace/tree', (req, res) => {
   const targetPath = req.query.path ? String(req.query.path) : process.cwd();
@@ -586,8 +668,23 @@ function writeWorkspaceFile(workspacePath, relPath, content) {
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
+  let originalContent = '';
+  let isNewFile = true;
+  if (fs.existsSync(absPath)) {
+    try {
+      originalContent = fs.readFileSync(absPath, 'utf8');
+      isNewFile = false;
+    } catch (e) {}
+  }
   fs.writeFileSync(absPath, content, 'utf8');
-  return { absPath, relPath: cleanRel, size: Buffer.byteLength(content) };
+  return {
+    absPath,
+    relPath: cleanRel,
+    size: Buffer.byteLength(content),
+    originalContent,
+    isNewFile,
+    content,
+  };
 }
 
 function readWorkspaceFile(workspacePath, relPath) {
@@ -1319,6 +1416,9 @@ The Antigravity backend will automatically create the files on disk and execute 
             path: resWrite.relPath,
             fullPath: resWrite.absPath,
             size: resWrite.size,
+            originalContent: resWrite.originalContent,
+            isNewFile: resWrite.isNewFile,
+            content: resWrite.content,
             source: 'native_tool_call',
           });
         } catch (err) {
@@ -1360,6 +1460,9 @@ The Antigravity backend will automatically create the files on disk and execute 
               path: resWrite.relPath,
               fullPath: resWrite.absPath,
               size: resWrite.size,
+              originalContent: resWrite.originalContent,
+              isNewFile: resWrite.isNewFile,
+              content: resWrite.content,
               source: 'extracted_block',
             });
           } catch (err) {

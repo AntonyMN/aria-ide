@@ -44,6 +44,7 @@ interface Props {
   onApplyPlan: (plan: PlanTask[]) => void;
   onFileSavedOrCreated: (createdFilePath?: string) => void;
   width?: number;
+  getOriginalContent?: (filePath: string) => string | undefined;
 }
 
 // Subcomponent for fenced code blocks with Copy button and custom interactive actions
@@ -60,21 +61,22 @@ const CodeBlock: React.FC<{
   const lang = match ? match[1] : '';
 
   // 1. Explicit file:path
-  if (lang.startsWith('file:')) {
-    const filePath = lang.replace('file:', '').trim();
+  if (lang.startsWith('file:') || lang.startsWith('write:')) {
+    const filePath = lang.replace(/^(file|write):/, '').trim();
     return (
       <div className="tool-pill" style={{ flexDirection: 'column', alignItems: 'stretch', margin: '10px 0', gap: 8 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             <FileEdit size={14} color="var(--accent-cyan)" />
-            <span style={{ fontWeight: 600 }}>Proposed File: <code>{filePath}</code></span>
+            <span style={{ fontWeight: 600 }}>File: <code>{filePath}</code></span>
+            <span className="badge badge-safe" style={{ fontSize: 9, padding: '2px 5px' }}>✓ Applied Directly</span>
           </div>
           <button
             className="btn-accept"
-            style={{ padding: '3px 10px', fontSize: 11 }}
+            style={{ padding: '3px 10px', fontSize: 11, display: 'flex', alignItems: 'center', gap: 4 }}
             onClick={() => onReviewFile(filePath, rawCode)}
           >
-            Review Diff & Apply
+            <span>🔍 Review Changes</span>
           </button>
         </div>
         <div style={{
@@ -172,7 +174,7 @@ const CodeBlock: React.FC<{
               title={candidateFile ? `Save directly to ${candidateFile}` : 'Save code to a file in workspace'}
             >
               <Zap size={10} />
-              <span>{candidateFile ? `Apply to ${candidateFile}` : 'Apply to File...'}</span>
+              <span>{candidateFile ? `Review Changes (${candidateFile})` : 'Review Changes...'}</span>
             </button>
           )}
 
@@ -205,6 +207,7 @@ export const AgentChatPane: React.FC<Props> = ({
   onApplyPlan,
   onFileSavedOrCreated,
   width,
+  getOriginalContent,
 }) => {
   const [inputPrompt, setInputPrompt] = useState('');
   const [thinkingEnabled, setThinkingEnabled] = useState(true);
@@ -364,12 +367,17 @@ export const AgentChatPane: React.FC<Props> = ({
   const handleReviewFileChange = async (filePath: string, newContent: string) => {
     try {
       let originalContent = '';
-      try {
-        const full = filePath.startsWith('/') ? filePath : `${workspacePath}/${filePath}`;
-        const fileData = await readFileContent(full);
-        originalContent = fileData.content;
-      } catch (e) {
-        originalContent = '// New file (does not exist yet)';
+      const cached = getOriginalContent ? getOriginalContent(filePath) : undefined;
+      if (cached !== undefined) {
+        originalContent = cached;
+      } else {
+        try {
+          const full = filePath.startsWith('/') ? filePath : `${workspacePath}/${filePath}`;
+          const fileData = await readFileContent(full);
+          originalContent = fileData.content;
+        } catch (e) {
+          originalContent = '// New file (created directly by AI)';
+        }
       }
 
       onOpenDiffReview({

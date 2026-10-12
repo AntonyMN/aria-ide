@@ -23,21 +23,21 @@ export const DiffReviewModal: React.FC<Props> = ({ diff, onAccept, onReject }) =
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
             <GitCompare size={20} color="var(--accent-cyan)" />
             <div>
-              <h2 style={{ fontSize: 15, fontWeight: 700 }}>Review AI Proposed File Changes</h2>
+              <h2 style={{ fontSize: 15, fontWeight: 700 }}>Review File Changes (Applied to Disk)</h2>
               <p style={{ fontSize: 12, color: 'var(--text-dim)', fontFamily: 'var(--font-mono)' }}>
-                {diff.filePath}
+                {diff.filePath} • Changes are applied directly. You can inspect the side-by-side diff or revert below.
               </p>
             </div>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <button className="btn-accept" onClick={() => onAccept(diff)}>
+            <button className="btn-accept" onClick={() => onAccept(diff)} title="Confirm and keep applied changes">
               <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                <Check size={14} /> Accept & Apply Changes
+                <Check size={14} /> Keep Changes
               </span>
             </button>
-            <button className="btn-reject" onClick={onReject}>
+            <button className="btn-reject" onClick={onReject} title="Revert file back to original state">
               <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                <X size={14} /> Reject
+                <X size={14} /> Revert Changes
               </span>
             </button>
           </div>

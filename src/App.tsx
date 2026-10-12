@@ -32,6 +32,7 @@ import { TerminalPane } from './components/TerminalPane';
 import { DiffReviewModal } from './components/DiffReviewModal';
 import { PlanDrawer } from './components/PlanDrawer';
 import { AgentChatPane } from './components/AgentChatPane';
+import { WorkspacePickerModal } from './components/WorkspacePickerModal';
 import {
   confirmStopGeneration,
   promptText,
@@ -60,9 +61,15 @@ export function App() {
   const [isModelModalOpen, setIsModelModalOpen] = useState(false);
 
   // Workspace & File Tree State
-  const [workspacePath, setWorkspacePath] = useState<string>('/home/anto/builds/ide');
+  const [workspacePath, setWorkspacePath] = useState<string>(() => {
+    return localStorage.getItem('ide_active_workspace') || '/home/anto/builds/ide';
+  });
+  const [isWorkspaceModalOpen, setIsWorkspaceModalOpen] = useState(true);
   const [fileTree, setFileTree] = useState<FileNode[]>([]);
   const [activeFilePath, setActiveFilePath] = useState<string>('');
+
+  // Diff History ref to track original file contents prior to direct apply
+  const fileDiffHistoryRef = useRef<Record<string, { originalContent: string; modifiedContent: string }>>({});
 
   // Tabs & Monaco Editor State
   const [tabs, setTabs] = useState<OpenTab[]>([]);
@@ -458,48 +465,85 @@ export function App() {
     }
   };
 
-  // Switch workspace path with SweetAlert2
-  const handleSwitchWorkspace = async () => {
-    const newPath = await promptText({
-      title: 'Switch Workspace Directory',
-      text: 'Enter the absolute path to your project folder:',
-      inputValue: workspacePath,
-      placeholder: '/home/username/project',
-      confirmButtonText: 'Open Workspace',
-    });
-    if (newPath && newPath !== workspacePath) {
+  // Switch workspace path: open visual directory explorer
+  const handleSwitchWorkspace = () => {
+    setIsWorkspaceModalOpen(true);
+  };
+
+  // Select workspace from WorkspacePickerModal and restore session
+  const handleSelectWorkspace = async (newPath: string) => {
+    try {
       setWorkspacePath(newPath);
-      loadWorkspace(newPath, true);
-      showSuccessToast('Workspace directory updated');
+      localStorage.setItem('ide_active_workspace', newPath);
+      // Reset state for newly selected workspace
+      setTabs([]);
+      setActiveFilePath('');
+      setActiveTabId('');
+      setMessages([]);
+      setPlanTasks([]);
+      await loadWorkspace(newPath, true);
+      setIsWorkspaceModalOpen(false);
+    } catch (err: any) {
+      showErrorAlert('Workspace Error', err.message || 'Could not open workspace');
     }
   };
 
-  // Accept Diff and apply to file
-  const handleAcceptDiff = async (diff: DiffProposal) => {
+  // Helper to look up original file content before AI direct overwrite
+  const getOriginalContent = (filePath: string): string | undefined => {
+    const clean = filePath.replace(/^(\.\/|\/)/, '');
+    if (fileDiffHistoryRef.current[filePath]?.originalContent !== undefined) {
+      return fileDiffHistoryRef.current[filePath].originalContent;
+    }
+    if (fileDiffHistoryRef.current[clean]?.originalContent !== undefined) {
+      return fileDiffHistoryRef.current[clean].originalContent;
+    }
+    const full = filePath.startsWith('/') ? filePath : `${workspacePath}/${clean}`;
+    if (fileDiffHistoryRef.current[full]?.originalContent !== undefined) {
+      return fileDiffHistoryRef.current[full].originalContent;
+    }
+    return undefined;
+  };
+
+  // Keep changes applied directly by the AI
+  const handleKeepDiff = (diff: DiffProposal) => {
+    setActiveDiff(null);
+    showSuccessToast(`Kept changes in ${diff.filePath}`);
+  };
+
+  // Revert Diff back to original file content
+  const handleRevertDiff = async (diff: DiffProposal) => {
     const fullPath = diff.filePath.startsWith('/')
       ? diff.filePath
       : `${workspacePath}/${diff.filePath}`;
     try {
-      await saveFileContent(fullPath, diff.modifiedContent);
+      if (!diff.originalContent || diff.originalContent.startsWith('// New file')) {
+        await deleteItem(fullPath);
+        setTabs((prev) => prev.filter((t) => t.path !== fullPath));
+        if (activeFilePath === fullPath) {
+          setActiveFilePath('');
+          setActiveTabId('');
+        }
+        showSuccessToast(`Reverted: deleted new file ${diff.filePath}`);
+      } else {
+        await saveFileContent(fullPath, diff.originalContent);
+        setTabs((prev) =>
+          prev.map((t) =>
+            t.path === fullPath
+              ? {
+                  ...t,
+                  content: diff.originalContent,
+                  savedContent: diff.originalContent,
+                  isDirty: false,
+                }
+              : t
+          )
+        );
+        showSuccessToast(`Reverted changes in ${diff.filePath}`);
+      }
       setActiveDiff(null);
-      // Reload tab if open
-      setTabs((prev) =>
-        prev.map((t) =>
-          t.path === fullPath
-            ? {
-                ...t,
-                content: diff.modifiedContent,
-                savedContent: diff.modifiedContent,
-                isDirty: false,
-              }
-            : t
-        )
-      );
-      loadWorkspace();
-      handleSelectFile(fullPath);
-      showSuccessToast('Changes applied successfully');
+      await loadWorkspace();
     } catch (err: any) {
-      await showErrorAlert('Failed to Apply Diff', err.message || String(err));
+      await showErrorAlert('Failed to Revert Changes', err.message || String(err));
     }
   };
 
@@ -630,6 +674,11 @@ export function App() {
         } else if (eventType === 'file_written' && dataStr) {
           try {
             const f = JSON.parse(dataStr);
+            fileDiffHistoryRef.current[f.path] = {
+              originalContent: f.originalContent ?? '',
+              modifiedContent: f.content ?? '',
+            };
+            fileDiffHistoryRef.current[f.fullPath] = fileDiffHistoryRef.current[f.path];
             writtenFiles.push(f);
             options.onFileWritten?.(f);
           } catch (e) {}
@@ -1060,6 +1109,7 @@ Please fix these syntax errors immediately. Provide corrected file content using
           onDeleteItem={handleDeleteItem}
           onRenameItem={() => {}}
           onRefresh={() => loadWorkspace()}
+          onSwitchWorkspace={handleSwitchWorkspace}
           currentRoot={workspacePath}
           width={leftSidebarWidth}
         />
@@ -1217,6 +1267,7 @@ Please fix these syntax errors immediately. Provide corrected file content using
               handleSelectFile(createdPath);
             }
           }}
+          getOriginalContent={getOriginalContent}
           width={rightSidebarWidth}
         />
       </div>
@@ -1255,8 +1306,15 @@ Please fix these syntax errors immediately. Provide corrected file content using
 
       <DiffReviewModal
         diff={activeDiff}
-        onAccept={handleAcceptDiff}
-        onReject={() => setActiveDiff(null)}
+        onAccept={handleKeepDiff}
+        onReject={() => activeDiff && handleRevertDiff(activeDiff)}
+      />
+
+      <WorkspacePickerModal
+        isOpen={isWorkspaceModalOpen}
+        onClose={() => setIsWorkspaceModalOpen(false)}
+        currentWorkspace={workspacePath}
+        onSelectWorkspace={handleSelectWorkspace}
       />
 
       {/* Fullscreen drag overlay during panel resize */}

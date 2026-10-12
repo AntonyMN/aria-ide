@@ -41,6 +41,7 @@ interface Props {
   workspacePath: string;
   onApplyPlan: (plan: PlanTask[]) => void;
   onFileSavedOrCreated: () => void;
+  width?: number;
 }
 
 // Subcomponent for fenced code blocks with Copy button and custom interactive actions
@@ -145,6 +146,7 @@ export const AgentChatPane: React.FC<Props> = ({
   workspacePath,
   onApplyPlan,
   onFileSavedOrCreated,
+  width,
 }) => {
   const [inputPrompt, setInputPrompt] = useState('');
   const [thinkingEnabled, setThinkingEnabled] = useState(true);
@@ -313,7 +315,10 @@ export const AgentChatPane: React.FC<Props> = ({
   };
 
   return (
-    <div className="ide-ai-panel">
+    <div
+      className="ide-ai-panel"
+      style={width !== undefined ? { width: `${width}px` } : undefined}
+    >
       <div className="ai-header">
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <Sparkles size={16} color="var(--accent-cyan)" />

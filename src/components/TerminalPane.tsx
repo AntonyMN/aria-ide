@@ -97,8 +97,18 @@ export const TerminalPane: React.FC<Props> = ({ currentCwd }) => {
     };
     window.addEventListener('resize', handleResize);
 
+    const resizeObserver = new ResizeObserver(() => {
+      try {
+        fitAddon.fit();
+      } catch (e) {}
+    });
+    if (terminalRef.current) {
+      resizeObserver.observe(terminalRef.current);
+    }
+
     return () => {
       window.removeEventListener('resize', handleResize);
+      resizeObserver.disconnect();
       if (wsRef.current) wsRef.current.close();
       term.dispose();
     };

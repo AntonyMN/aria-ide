@@ -25,6 +25,7 @@ interface Props {
   onRenameItem: (targetPath: string) => void;
   onRefresh: () => void;
   currentRoot: string;
+  width?: number;
 }
 
 const getFileIcon = (fileName: string) => {
@@ -147,11 +148,15 @@ export const FileTree: React.FC<Props> = ({
   onRenameItem,
   onRefresh,
   currentRoot,
+  width,
 }) => {
   const [filterText, setFilterText] = useState('');
 
   return (
-    <div className="ide-sidebar">
+    <div
+      className="ide-sidebar"
+      style={width !== undefined ? { width: `${width}px` } : undefined}
+    >
       <div className="sidebar-header">
         <span>EXPLORER</span>
         <div className="sidebar-actions">

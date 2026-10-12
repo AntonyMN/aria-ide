@@ -67,6 +67,119 @@ export function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
 
+  // Resizable Panels State
+  const [leftSidebarWidth, setLeftSidebarWidth] = useState<number>(() => {
+    const saved = localStorage.getItem('ide_left_sidebar_width');
+    return saved ? Math.max(160, Math.min(650, parseInt(saved, 10) || 260)) : 260;
+  });
+
+  const [rightSidebarWidth, setRightSidebarWidth] = useState<number>(() => {
+    const saved = localStorage.getItem('ide_right_sidebar_width');
+    return saved ? Math.max(280, Math.min(850, parseInt(saved, 10) || 420)) : 420;
+  });
+
+  const [bottomDockHeight, setBottomDockHeight] = useState<number>(() => {
+    const saved = localStorage.getItem('ide_bottom_dock_height');
+    return saved ? Math.max(90, Math.min(650, parseInt(saved, 10) || 240)) : 240;
+  });
+
+  const [dragging, setDragging] = useState<'left' | 'right' | 'bottom' | null>(null);
+
+  const dragStartRef = useRef<{
+    startX: number;
+    startY: number;
+    startWidth: number;
+    startHeight: number;
+  }>({ startX: 0, startY: 0, startWidth: 0, startHeight: 0 });
+
+  const leftWidthRef = useRef(leftSidebarWidth);
+  leftWidthRef.current = leftSidebarWidth;
+
+  const rightWidthRef = useRef(rightSidebarWidth);
+  rightWidthRef.current = rightSidebarWidth;
+
+  // Persist sidebar dimensions
+  useEffect(() => {
+    localStorage.setItem('ide_left_sidebar_width', String(leftSidebarWidth));
+  }, [leftSidebarWidth]);
+
+  useEffect(() => {
+    localStorage.setItem('ide_right_sidebar_width', String(rightSidebarWidth));
+  }, [rightSidebarWidth]);
+
+  useEffect(() => {
+    localStorage.setItem('ide_bottom_dock_height', String(bottomDockHeight));
+  }, [bottomDockHeight]);
+
+  // Mouse move and up handler for smooth panel resizing
+  useEffect(() => {
+    if (!dragging) return;
+
+    const handleMouseMove = (e: MouseEvent) => {
+      if (dragging === 'left') {
+        const delta = e.clientX - dragStartRef.current.startX;
+        const maxAllowed = Math.min(650, window.innerWidth - rightWidthRef.current - 250);
+        const newWidth = Math.max(160, Math.min(maxAllowed, dragStartRef.current.startWidth + delta));
+        setLeftSidebarWidth(newWidth);
+      } else if (dragging === 'right') {
+        const delta = dragStartRef.current.startX - e.clientX;
+        const maxAllowed = Math.min(850, window.innerWidth - leftWidthRef.current - 250);
+        const newWidth = Math.max(280, Math.min(maxAllowed, dragStartRef.current.startWidth + delta));
+        setRightSidebarWidth(newWidth);
+      } else if (dragging === 'bottom') {
+        const delta = dragStartRef.current.startY - e.clientY;
+        const maxAllowed = Math.min(650, window.innerHeight - 180);
+        const newHeight = Math.max(90, Math.min(maxAllowed, dragStartRef.current.startHeight + delta));
+        setBottomDockHeight(newHeight);
+      }
+    };
+
+    const handleMouseUp = () => {
+      setDragging(null);
+    };
+
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [dragging]);
+
+  const handleStartResizeLeft = (e: React.MouseEvent) => {
+    e.preventDefault();
+    dragStartRef.current = {
+      startX: e.clientX,
+      startY: e.clientY,
+      startWidth: leftSidebarWidth,
+      startHeight: 0,
+    };
+    setDragging('left');
+  };
+
+  const handleStartResizeRight = (e: React.MouseEvent) => {
+    e.preventDefault();
+    dragStartRef.current = {
+      startX: e.clientX,
+      startY: e.clientY,
+      startWidth: rightSidebarWidth,
+      startHeight: 0,
+    };
+    setDragging('right');
+  };
+
+  const handleStartResizeBottom = (e: React.MouseEvent) => {
+    e.preventDefault();
+    dragStartRef.current = {
+      startX: e.clientX,
+      startY: e.clientY,
+      startWidth: 0,
+      startHeight: bottomDockHeight,
+    };
+    setDragging('bottom');
+  };
+
   // Initial Load: Discover models & workspace
   const loadModelsAndHardware = async () => {
     try {
@@ -535,6 +648,15 @@ export function App() {
           onRenameItem={() => {}}
           onRefresh={() => loadWorkspace()}
           currentRoot={workspacePath}
+          width={leftSidebarWidth}
+        />
+
+        {/* Left Sidebar Resizer */}
+        <div
+          className={`ide-resizer ide-resizer-col ${dragging === 'left' ? 'resizing' : ''}`}
+          onMouseDown={handleStartResizeLeft}
+          onDoubleClick={() => setLeftSidebarWidth(260)}
+          title="Drag to resize Explorer. Double-click to reset (260px)"
         />
 
         {/* Center: Monaco Editor + Bottom Dock */}
@@ -603,8 +725,16 @@ export function App() {
             )}
           </div>
 
+          {/* Bottom Dock Resizer */}
+          <div
+            className={`ide-resizer ide-resizer-row ${dragging === 'bottom' ? 'resizing' : ''}`}
+            onMouseDown={handleStartResizeBottom}
+            onDoubleClick={() => setBottomDockHeight(240)}
+            title="Drag to resize Bottom panel. Double-click to reset (240px)"
+          />
+
           {/* Bottom Dock (Terminal / Implementation Plan) */}
-          <div className="bottom-dock">
+          <div className="bottom-dock" style={{ height: `${bottomDockHeight}px` }}>
             <div className="dock-header">
               <div className="dock-tabs">
                 <button
@@ -650,6 +780,14 @@ export function App() {
           </div>
         </div>
 
+        {/* Right Sidebar Resizer */}
+        <div
+          className={`ide-resizer ide-resizer-col ${dragging === 'right' ? 'resizing' : ''}`}
+          onMouseDown={handleStartResizeRight}
+          onDoubleClick={() => setRightSidebarWidth(420)}
+          title="Drag to resize AI Assistant. Double-click to reset (420px)"
+        />
+
         {/* Right: AI Assistant & Agent Loop */}
         <AgentChatPane
           messages={messages}
@@ -661,6 +799,7 @@ export function App() {
           workspacePath={workspacePath}
           onApplyPlan={(newPlan) => setPlanTasks(newPlan)}
           onFileSavedOrCreated={() => loadWorkspace()}
+          width={rightSidebarWidth}
         />
       </div>
 
@@ -697,6 +836,16 @@ export function App() {
         onAccept={handleAcceptDiff}
         onReject={() => setActiveDiff(null)}
       />
+
+      {/* Fullscreen drag overlay during panel resize */}
+      {dragging && (
+        <div
+          className="ide-resize-overlay"
+          style={{
+            cursor: dragging === 'bottom' ? 'row-resize' : 'col-resize',
+          }}
+        />
+      )}
     </div>
   );
 }

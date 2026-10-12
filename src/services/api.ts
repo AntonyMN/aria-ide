@@ -1,4 +1,4 @@
-import type { LocalModel, SystemMemory, FileNode } from '../types';
+import type { LocalModel, SystemMemory, FileNode, ExecutionPhase, PlanTask } from '../types';
 
 const API_BASE = 'http://localhost:3001/api';
 
@@ -127,4 +127,52 @@ export async function stopAgentGeneration(): Promise<boolean> {
     return false;
   }
 }
+
+export async function generateImplementationPlan(params: {
+  model: string;
+  prompt: string;
+  workspacePath: string;
+}): Promise<{
+  success: boolean;
+  planMarkdown: string;
+  phases: ExecutionPhase[];
+  tasks: PlanTask[];
+  planFilePath: string;
+  planFileRelative: string;
+}> {
+  const res = await fetch(`${API_BASE}/agent/plan`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(err || 'Failed to generate implementation plan');
+  }
+  return res.json();
+}
+
+export async function verifyWorkspaceFiles(params: {
+  workspacePath: string;
+  files: string[];
+}): Promise<{
+  success: boolean;
+  verified: boolean;
+  results: {
+    path: string;
+    exists: boolean;
+    size?: number;
+    hasError?: boolean;
+    error?: string | null;
+  }[];
+}> {
+  const res = await fetch(`${API_BASE}/agent/verify`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+  if (!res.ok) throw new Error('Failed to verify workspace files');
+  return res.json();
+}
+
 

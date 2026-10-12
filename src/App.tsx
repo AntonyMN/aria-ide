@@ -7,6 +7,7 @@ import type {
   OpenTab,
   DiffProposal,
   PlanTask,
+  ExecutionPhase,
   ChatMessage,
 } from './types';
 import {
@@ -19,6 +20,8 @@ import {
   deleteItem,
   detectLanguage,
   stopAgentGeneration,
+  generateImplementationPlan,
+  verifyWorkspaceFiles,
 } from './services/api';
 import { FileTree } from './components/FileTree';
 import { ModelSelectorModal } from './components/ModelSelectorModal';
@@ -233,16 +236,16 @@ export function App() {
   }, []);
 
   // Open file in editor tab
-  const handleSelectFile = async (filePath: string) => {
+  const handleSelectFile = async (filePath: string, providedContent?: string) => {
     setActiveFilePath(filePath);
     const existing = tabs.find((t) => t.path === filePath);
-    if (existing) {
+    if (existing && providedContent === undefined) {
       setActiveTabId(existing.id);
       return;
     }
 
     try {
-      const { content } = await readFileContent(filePath);
+      const content = providedContent !== undefined ? providedContent : (await readFileContent(filePath)).content;
       const name = filePath.split('/').pop() || filePath;
       const newTab: OpenTab = {
         id: filePath,
@@ -254,7 +257,10 @@ export function App() {
         language: detectLanguage(filePath),
       };
 
-      setTabs((prev) => [...prev, newTab]);
+      setTabs((prev) => {
+        const withoutOld = prev.filter((t) => t.path !== filePath);
+        return [...withoutOld, newTab];
+      });
       setActiveTabId(newTab.id);
     } catch (err) {
       console.error('Failed to open file:', err);
@@ -470,7 +476,119 @@ export function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isStreaming]);
 
-  // Agent Chat Streaming Handler
+  // Helper to stream a prompt from the backend agent
+  const streamAgentTask = async (
+    targetPrompt: string,
+    targetMsgId: string,
+    options: {
+      thinkingEnabled: boolean;
+      autoApplyFiles?: boolean;
+      autoExecuteCommands?: boolean;
+      onFileWritten?: (file: { path: string; fullPath: string; size: number }) => void;
+      onCommandExecuted?: (cmd: { command: string; success: boolean; exitCode: number; stdout: string; stderr: string; hasError: boolean }) => void;
+    }
+  ): Promise<{
+    totalContent: string;
+    writtenFiles: { path: string; fullPath: string; size: number }[];
+    executedCommands: { command: string; success: boolean; exitCode: number; stdout: string; stderr: string; hasError: boolean }[];
+  }> => {
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
+    const response = await fetch('http://localhost:3001/api/agent/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
+      body: JSON.stringify({
+        model: selectedModel,
+        prompt: targetPrompt,
+        workspacePath,
+        thinkingEnabled: options.thinkingEnabled,
+        autoApplyFiles: options.autoApplyFiles ?? true,
+        autoExecuteCommands: options.autoExecuteCommands ?? true,
+        conversationHistory: messages.slice(-4).map((m) => ({
+          role: m.role,
+          content: m.content,
+        })),
+      }),
+    });
+
+    if (!response.body) throw new Error('No streaming response body');
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let totalContent = '';
+    const writtenFiles: { path: string; fullPath: string; size: number }[] = [];
+    const executedCommands: { command: string; success: boolean; exitCode: number; stdout: string; stderr: string; hasError: boolean }[] = [];
+
+    while (true) {
+      if (controller.signal.aborted) break;
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const events = buffer.split('\n\n');
+      buffer = events.pop() || '';
+
+      for (const ev of events) {
+        if (!ev.trim() || controller.signal.aborted) continue;
+        const lines = ev.split('\n');
+        let eventType = 'message';
+        let dataStr = '';
+
+        for (const line of lines) {
+          if (line.startsWith('event: ')) eventType = line.substring(7);
+          if (line.startsWith('data: ')) dataStr = line.substring(6);
+        }
+
+        if (eventType === 'chunk' && dataStr) {
+          try {
+            const data = JSON.parse(dataStr);
+            totalContent += data.chunk || '';
+            setMessages((prev) =>
+              prev.map((m) => {
+                if (m.id !== targetMsgId) return m;
+                if (data.isThinking) {
+                  return { ...m, thinking: (m.thinking || '') + data.chunk };
+                } else {
+                  return { ...m, content: m.content + data.chunk };
+                }
+              })
+            );
+          } catch (e) {}
+        } else if (eventType === 'file_written' && dataStr) {
+          try {
+            const f = JSON.parse(dataStr);
+            writtenFiles.push(f);
+            options.onFileWritten?.(f);
+          } catch (e) {}
+        } else if (eventType === 'command_executed' && dataStr) {
+          try {
+            const c = JSON.parse(dataStr);
+            executedCommands.push(c);
+            options.onCommandExecuted?.(c);
+          } catch (e) {}
+        } else if (eventType === 'done' && dataStr) {
+          try {
+            const d = JSON.parse(dataStr);
+            if (d.writtenFiles) {
+              for (const wf of d.writtenFiles) {
+                if (!writtenFiles.some((w) => w.path === wf.relPath || w.path === wf.path)) {
+                  writtenFiles.push(wf);
+                  options.onFileWritten?.(wf);
+                }
+              }
+            }
+          } catch (e) {}
+        }
+      }
+    }
+
+    return { totalContent, writtenFiles, executedCommands };
+  };
+
+  // Agent Chat Streaming Handler: Autonomous Phased Pipeline
   const handleSendMessage = async (
     prompt: string,
     options: { thinkingEnabled: boolean; mode: 'chat' | 'plan' }
@@ -487,115 +605,285 @@ export function App() {
       content: prompt,
       timestamp: Date.now(),
     };
-
-    const assistantMsgId = `asst-${Date.now()}`;
-    const assistantMsg: ChatMessage = {
-      id: assistantMsgId,
-      role: 'assistant',
-      content: '',
-      thinking: '',
-      isStreaming: true,
-      timestamp: Date.now(),
-    };
-
-    setMessages((prev) => [...prev, userMsg, assistantMsg]);
+    setMessages((prev) => [...prev, userMsg]);
     setIsStreaming(true);
 
-    const controller = new AbortController();
-    abortControllerRef.current = controller;
+    const isActionable =
+      options.mode === 'plan' ||
+      /(\b(build|create|make|code|write|implement|scaffold|setup|develop|add|fix|refactor|install|generate)\b)/i.test(prompt);
 
     try {
-      const response = await fetch('http://localhost:3001/api/agent/stream', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: controller.signal,
-        body: JSON.stringify({
+      if (!isActionable) {
+        // Standard conversational interaction
+        const assistantMsgId = `asst-${Date.now()}`;
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: assistantMsgId,
+            role: 'assistant',
+            content: '',
+            thinking: '',
+            isStreaming: true,
+            timestamp: Date.now(),
+          },
+        ]);
+
+        await streamAgentTask(prompt, assistantMsgId, {
+          thinkingEnabled: options.thinkingEnabled,
+          onFileWritten: (file) => {
+            loadWorkspace();
+            handleSelectFile(file.fullPath);
+            showSuccessToast(`Created ${file.path}`);
+          },
+        });
+
+        setMessages((prev) =>
+          prev.map((m) => (m.id === assistantMsgId ? { ...m, isStreaming: false } : m))
+        );
+      } else {
+        // =========================================================================
+        // AUTONOMOUS MULTI-PHASED PIPELINE
+        // =========================================================================
+        // Step 1: Prompt LLM to break task into detailed phases & write out on Monaco
+        const planMsgId = `plan-msg-${Date.now()}`;
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: planMsgId,
+            role: 'assistant',
+            content: '📋 **Analyzing requirements and generating Phased Implementation Plan...**',
+            isStreaming: true,
+            timestamp: Date.now(),
+          },
+        ]);
+
+        const planResult = await generateImplementationPlan({
           model: selectedModel,
           prompt,
           workspacePath,
-          thinkingEnabled: options.thinkingEnabled,
-          mode: options.mode,
-          conversationHistory: messages.map((m) => ({
-            role: m.role,
-            content: m.content,
-          })),
-        }),
-      });
+        });
 
-      if (!response.body) throw new Error('No streaming body');
+        if (abortControllerRef.current?.signal.aborted) return;
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
+        // Write out on Monaco Editor!
+        await loadWorkspace();
+        await handleSelectFile(planResult.planFilePath, planResult.planMarkdown);
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+        // Update Plan Drawer tasks
+        setPlanTasks(planResult.tasks);
+        setActiveDockTab('plan');
 
-        buffer += decoder.decode(value, { stream: true });
-        const events = buffer.split('\n\n');
-        buffer = events.pop() || '';
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === planMsgId
+              ? {
+                  ...m,
+                  content: `📋 **Implementation Plan generated!**\n\nThe plan has been written to \`IMPLEMENTATION_PLAN.md\` and opened in Monaco Editor.\n\n${planResult.planMarkdown}\n\n---\n*Starting phased execution queue (${planResult.phases.length} phases)...*`,
+                  isStreaming: false,
+                }
+              : m
+          )
+        );
 
-        for (const ev of events) {
-          if (!ev.trim()) continue;
-          const lines = ev.split('\n');
-          let eventType = 'message';
-          let dataStr = '';
+        // Step 2: Queue phases sequentially, starting from phase 1 to completion
+        const allCreatedFiles: string[] = [];
 
-          for (const line of lines) {
-            if (line.startsWith('event: ')) eventType = line.substring(7);
-            if (line.startsWith('data: ')) dataStr = line.substring(6);
-          }
+        for (let i = 0; i < planResult.phases.length; i++) {
+          if (abortControllerRef.current?.signal.aborted) break;
 
-          if (eventType === 'chunk' && dataStr) {
-            try {
-              const data = JSON.parse(dataStr);
-              setMessages((prev) =>
-                prev.map((m) => {
-                  if (m.id !== assistantMsgId) return m;
-                  if (data.isThinking) {
-                    return { ...m, thinking: (m.thinking || '') + data.chunk };
-                  } else {
-                    return { ...m, content: m.content + data.chunk };
-                  }
-                })
-              );
-            } catch (e) {}
-          } else if (eventType === 'done' && dataStr) {
-            try {
-              const doneData = JSON.parse(dataStr);
-              // Check if response contains an implementation plan list
-              const planMatches = [
-                ...doneData.totalContent.matchAll(/- \[[ xX]\]\s*([^\n]+)/g),
-              ];
-              if (planMatches.length > 0) {
-                const newTasks: PlanTask[] = planMatches.map((m: any, idx: number) => ({
-                  id: `task-${idx}-${Date.now()}`,
-                  title: m[1],
-                  completed: m[0].includes('[x]') || m[0].includes('[X]'),
-                }));
-                setPlanTasks(newTasks);
-                setActiveDockTab('plan');
+          const phase = planResult.phases[i];
+          const phaseMsgId = `phase-${phase.number}-${Date.now()}`;
+
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: phaseMsgId,
+              role: 'assistant',
+              content: `🚀 **Phase ${phase.number}/${planResult.phases.length}: ${phase.title}**\n\n*Target Files:* ${phase.targetFiles.join(', ') || 'Auto-detected'}\n*Commands:* ${phase.commands.join(', ') || 'Auto-detected'}\n\n`,
+              thinking: '',
+              isStreaming: true,
+              timestamp: Date.now(),
+            },
+          ]);
+
+          const phasePrompt = `We are executing Phase ${phase.number} of ${planResult.phases.length} for: "${prompt}".
+PHASE TITLE: ${phase.title}
+
+GOAL & SPECIFICATIONS:
+${phase.description}
+
+TARGET FILES TO CREATE OR UPDATE:
+${phase.targetFiles.length > 0 ? phase.targetFiles.map((f) => `- ${f}`).join('\n') : 'Create or update necessary files'}
+
+COMMANDS TO RUN:
+${phase.commands.length > 0 ? phase.commands.map((c) => `- ${c}`).join('\n') : 'None or run setup/build commands'}
+
+CRITICAL INSTRUCTIONS:
+- Write the complete code for all files needed for this phase.
+- Use explicit markdown code blocks:
+\`\`\`file:relative/path/to/file.ext
+[full complete code here]
+\`\`\`
+- Or call the native write_file tool.
+- If commands are needed, use:
+\`\`\`bash:run
+command to execute
+\`\`\`
+- Or call the native run_terminal_command tool.
+- Antigravity IDE will automatically write files to disk, sync Monaco Editor, and execute commands.`;
+
+          const phaseResult = await streamAgentTask(phasePrompt, phaseMsgId, {
+            thinkingEnabled: options.thinkingEnabled,
+            onFileWritten: (file) => {
+              allCreatedFiles.push(file.fullPath);
+              loadWorkspace();
+              handleSelectFile(file.fullPath);
+              showSuccessToast(`Created/Updated ${file.path}`);
+            },
+            onCommandExecuted: async (cmd) => {
+              // Autonomous Verification & Error-Checking Loop
+              if (cmd.hasError) {
+                showWarningAlert('Command Error', `Command "${cmd.command}" failed. Initiating self-correction...`);
+                const fixPrompt = `Command failed during Phase ${phase.number}:
+Command: ${cmd.command}
+Exit code: ${cmd.exitCode}
+Error: ${cmd.stderr || cmd.stdout}
+
+Please diagnose this error and provide immediate self-correction using \`\`\`file:path or \`\`\`bash:run to resolve it.`;
+
+                const fixMsgId = `fix-${Date.now()}`;
+                setMessages((p) => [
+                  ...p,
+                  {
+                    id: fixMsgId,
+                    role: 'assistant',
+                    content: `⚠️ **Self-Correction for command failure:**\n\n`,
+                    isStreaming: true,
+                    timestamp: Date.now(),
+                  },
+                ]);
+
+                await streamAgentTask(fixPrompt, fixMsgId, {
+                  thinkingEnabled: false,
+                  onFileWritten: (f) => {
+                    allCreatedFiles.push(f.fullPath);
+                    loadWorkspace();
+                    handleSelectFile(f.fullPath);
+                  },
+                });
+
+                setMessages((p) =>
+                  p.map((m) => (m.id === fixMsgId ? { ...m, isStreaming: false } : m))
+                );
               }
-            } catch (e) {}
+            },
+          });
+
+          // Mark checklist tasks completed for this phase
+          setPlanTasks((prev) =>
+            prev.map((t, idx) => {
+              if (idx < (i + 1) * Math.ceil(prev.length / planResult.phases.length)) {
+                return { ...t, completed: true };
+              }
+              return t;
+            })
+          );
+
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === phaseMsgId
+                ? {
+                    ...m,
+                    content:
+                      m.content +
+                      `\n\n✅ **Phase ${phase.number} Complete!** (${phaseResult.writtenFiles.length} files written, ${phaseResult.executedCommands.length} commands run)`,
+                    isStreaming: false,
+                  }
+                : m
+            )
+          );
+        }
+
+        // Step 3: Verification & Error-Checking Loop on created files
+        if (!abortControllerRef.current?.signal.aborted) {
+          const treeRes = await fetchFileTree(workspacePath);
+          const workspaceFileNames = treeRes.tree
+            .filter((f) => !f.isDirectory && f.name !== 'IMPLEMENTATION_PLAN.md')
+            .map((f) => f.name);
+
+          if (workspaceFileNames.length > 0) {
+            try {
+              const verifyRes = await verifyWorkspaceFiles({
+                workspacePath,
+                files: workspaceFileNames,
+              });
+
+              if (!verifyRes.verified) {
+                const errorFiles = verifyRes.results.filter((r) => r.hasError || !r.exists);
+                const fixPrompt = `Syntax or validation errors detected in workspace files:
+${errorFiles.map((e) => `- ${e.path}: ${e.error}`).join('\n')}
+
+Please fix these syntax errors immediately. Provide corrected file content using \`\`\`file:path.`;
+
+                const fixMsgId = `verify-fix-${Date.now()}`;
+                setMessages((p) => [
+                  ...p,
+                  {
+                    id: fixMsgId,
+                    role: 'assistant',
+                    content: `🛠️ **Self-Healing Syntax Errors:**\n\n`,
+                    isStreaming: true,
+                    timestamp: Date.now(),
+                  },
+                ]);
+
+                await streamAgentTask(fixPrompt, fixMsgId, {
+                  thinkingEnabled: false,
+                  onFileWritten: (f) => {
+                    loadWorkspace();
+                    handleSelectFile(f.fullPath);
+                  },
+                });
+
+                setMessages((p) =>
+                  p.map((m) => (m.id === fixMsgId ? { ...m, isStreaming: false } : m))
+                );
+              }
+            } catch (vErr) {
+              console.error('Verification error:', vErr);
+            }
           }
+
+          // Final completion celebration summary
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `summary-${Date.now()}`,
+              role: 'assistant',
+              content: `🎉 **Implementation Completed Successfully!**\n\nAll ${planResult.phases.length} phases executed. Files have been generated, verified, and loaded into Monaco Editor.\n\n📂 Project Workspace: \`${workspacePath}\``,
+              timestamp: Date.now(),
+            },
+          ]);
+
+          showSuccessToast('All Phases Executed Successfully!');
         }
       }
     } catch (err: any) {
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === assistantMsgId
-            ? { ...m, content: `Error: ${err.message}` }
-            : m
-        )
-      );
+      if (err.name !== 'AbortError') {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `err-${Date.now()}`,
+            role: 'assistant',
+            content: `❌ Error: ${err.message}`,
+            timestamp: Date.now(),
+          },
+        ]);
+        showErrorAlert('Agent Error', err.message || String(err));
+      }
     } finally {
       setIsStreaming(false);
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === assistantMsgId ? { ...m, isStreaming: false } : m
-        )
-      );
+      abortControllerRef.current = null;
     }
   };
 
@@ -853,7 +1141,12 @@ export function App() {
           onOpenDiffReview={(diff) => setActiveDiff(diff)}
           workspacePath={workspacePath}
           onApplyPlan={(newPlan) => setPlanTasks(newPlan)}
-          onFileSavedOrCreated={() => loadWorkspace()}
+          onFileSavedOrCreated={(createdPath) => {
+            loadWorkspace();
+            if (createdPath) {
+              handleSelectFile(createdPath);
+            }
+          }}
           width={rightSidebarWidth}
         />
       </div>

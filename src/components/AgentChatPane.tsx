@@ -25,8 +25,10 @@ import {
   CheckCircle2,
   AlertTriangle,
   Square,
+  FileCode,
 } from 'lucide-react';
 import { runTerminalCommand, readFileContent, saveFileContent } from '../services/api';
+import { promptText } from '../services/alerts';
 
 interface Props {
   messages: ChatMessage[];
@@ -40,7 +42,7 @@ interface Props {
   onOpenDiffReview: (diff: DiffProposal) => void;
   workspacePath: string;
   onApplyPlan: (plan: PlanTask[]) => void;
-  onFileSavedOrCreated: () => void;
+  onFileSavedOrCreated: (createdFilePath?: string) => void;
   width?: number;
 }
 
@@ -54,10 +56,10 @@ const CodeBlock: React.FC<{
   const [copied, setCopied] = useState(false);
   const rawCode = String(children).replace(/\n$/, '');
 
-  // Check for custom action headers like language-file:path/to/file or language-bash:run
   const match = /language-(\S+)/.exec(className || '');
   const lang = match ? match[1] : '';
 
+  // 1. Explicit file:path
   if (lang.startsWith('file:')) {
     const filePath = lang.replace('file:', '').trim();
     return (
@@ -91,6 +93,7 @@ const CodeBlock: React.FC<{
     );
   }
 
+  // 2. Explicit bash:run
   if (lang === 'bash:run') {
     return (
       <div className="tool-pill" style={{ justifyContent: 'space-between', margin: '8px 0', alignItems: 'center' }}>
@@ -109,25 +112,80 @@ const CodeBlock: React.FC<{
     );
   }
 
+  // 3. Fallback Heuristic: Candidate filename in comment or preceding text
+  const firstLine = rawCode.split('\n')[0].trim();
+  const commentMatch = /(?:\/\/|\/\*|<!--|#)\s*([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]{1,8})/i.exec(firstLine);
+  let candidateFile = commentMatch ? commentMatch[1] : '';
+
+  if (!candidateFile && lang.includes(':')) {
+    candidateFile = lang.split(':')[1].trim();
+  }
+
   const handleCopy = () => {
     navigator.clipboard.writeText(rawCode);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
 
+  const isBash = ['bash', 'sh', 'shell', 'zsh', 'terminal'].includes(lang.toLowerCase());
+
+  const handleManualSave = async () => {
+    if (candidateFile) {
+      onReviewFile(candidateFile, rawCode);
+    } else {
+      const fileName = await promptText({
+        title: 'Save Code to File',
+        placeholder: 'e.g. script.js, index.html',
+        confirmButtonText: 'Save File',
+      });
+      if (fileName) {
+        onReviewFile(fileName, rawCode);
+      }
+    }
+  };
+
   return (
     <div className="markdown-code-block">
       <div className="markdown-code-header">
-        <span>{lang || 'code'}</span>
-        <button
-          className="icon-btn"
-          style={{ fontSize: 11, display: 'flex', alignItems: 'center', gap: 4, padding: '2px 6px' }}
-          onClick={handleCopy}
-          title="Copy code"
-        >
-          {copied ? <Check size={12} color="var(--accent-emerald)" /> : <Copy size={12} />}
-          <span>{copied ? 'Copied' : 'Copy'}</span>
-        </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          {candidateFile ? <FileCode size={13} color="var(--accent-cyan)" /> : null}
+          <span style={{ fontWeight: 600 }}>{candidateFile ? candidateFile : (lang || 'code')}</span>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          {isBash && (
+            <button
+              className="send-btn"
+              style={{ padding: '2px 8px', fontSize: 11, height: 'auto', display: 'flex', alignItems: 'center', gap: 4 }}
+              onClick={() => onExecuteCommand(rawCode)}
+              title="Run this shell command in terminal"
+            >
+              <Play size={10} />
+              <span>Run</span>
+            </button>
+          )}
+
+          {!isBash && (
+            <button
+              className="btn-accept"
+              style={{ padding: '2px 8px', fontSize: 11, display: 'flex', alignItems: 'center', gap: 4 }}
+              onClick={handleManualSave}
+              title={candidateFile ? `Save directly to ${candidateFile}` : 'Save code to a file in workspace'}
+            >
+              <Zap size={10} />
+              <span>{candidateFile ? `Apply to ${candidateFile}` : 'Apply to File...'}</span>
+            </button>
+          )}
+
+          <button
+            className="icon-btn"
+            style={{ fontSize: 11, display: 'flex', alignItems: 'center', gap: 4, padding: '2px 6px' }}
+            onClick={handleCopy}
+            title="Copy code"
+          >
+            {copied ? <Check size={12} color="var(--accent-emerald)" /> : <Copy size={12} />}
+            <span>{copied ? 'Copied' : 'Copy'}</span>
+          </button>
+        </div>
       </div>
       <div className="markdown-code-content">
         <pre>{rawCode}</pre>
@@ -168,12 +226,39 @@ export const AgentChatPane: React.FC<Props> = ({
 
   // Helper to extract file modifications and bash commands from raw markdown text
   const extractActions = (content: string) => {
-    const fileMatches = [
-      ...content.matchAll(/```(?:file:([^\n]+))\n([\s\S]*?)```/g),
-    ];
-    const bashMatches = [
-      ...content.matchAll(/```(?:bash:run)\n([\s\S]*?)```/g),
-    ];
+    const fileMatches: Array<{ path: string; content: string }> = [];
+    const bashMatches: Array<{ command: string }> = [];
+
+    // 1. Explicit ```file:filename
+    for (const m of content.matchAll(/```(?:file:([^\n]+))\n([\s\S]*?)```/g)) {
+      fileMatches.push({ path: m[1].trim(), content: m[2] });
+    }
+
+    // 2. Explicit ```bash:run
+    for (const m of content.matchAll(/```(?:bash:run)\n([\s\S]*?)```/g)) {
+      bashMatches.push({ command: m[1].trim() });
+    }
+
+    // 3. Fallback Heuristic: Filename in parentheses or text preceding a code block
+    // e.g. "create a new JavaScript file ( script.js ) to handle the calculations: ```javascript"
+    const heuristicRegex = /(?:create|file|in|named|modify)?\s*\(?\s*([a-zA-Z0-9_\-./]+\.(?:js|ts|jsx|tsx|html|css|json|py|php|rs|vue|sh|md|sql))\s*\)?[\s\S]{0,90}```(?:[a-zA-Z0-9_-]+)?\n([\s\S]*?)```/gi;
+    for (const m of content.matchAll(heuristicRegex)) {
+      const fileName = m[1].trim();
+      const code = m[2];
+      if (!fileName.includes(' ') && !fileMatches.some((f) => f.path === fileName) && code.trim().length > 0) {
+        fileMatches.push({ path: fileName, content: code });
+      }
+    }
+
+    // 4. Fallback: Code block where first line is a filename comment: // script.js
+    const commentRegex = /```(?:[a-zA-Z0-9_-]+)?\n(?:\/\/|\/\*|<!--|#)\s*([a-zA-Z0-9_\-./]+\.(?:js|ts|jsx|tsx|html|css|json|py|php|rs|vue|sh|md|sql))[\s\S]*?\n([\s\S]*?)```/gi;
+    for (const m of content.matchAll(commentRegex)) {
+      const fileName = m[1].trim();
+      const code = m[0].replace(/```[^\n]*\n/, '').replace(/\n```$/, '');
+      if (!fileName.includes(' ') && !fileMatches.some((f) => f.path === fileName)) {
+        fileMatches.push({ path: fileName, content: code });
+      }
+    }
 
     return { fileMatches, bashMatches };
   };
@@ -195,18 +280,20 @@ export const AgentChatPane: React.FC<Props> = ({
 
     try {
       // 1. Write / update files
+      let lastCreatedPath = '';
       for (let i = 0; i < fileMatches.length; i++) {
-        const filePath = fileMatches[i][1].trim();
-        const fileContent = fileMatches[i][2];
+        const filePath = fileMatches[i].path.trim();
+        const fileContent = fileMatches[i].content;
         const fullPath = filePath.startsWith('/') ? filePath : `${workspacePath}/${filePath}`;
         setExecutionState((prev) => ({
           ...prev,
           [msgId]: { status: 'running', log: `Writing file [${i + 1}/${fileMatches.length}]: ${filePath}...` },
         }));
         await saveFileContent(fullPath, fileContent);
+        lastCreatedPath = fullPath;
       }
 
-      onFileSavedOrCreated();
+      onFileSavedOrCreated(lastCreatedPath);
 
       // 2. Execute bash commands sequentially
       for (let j = 0; j < bashMatches.length; j++) {

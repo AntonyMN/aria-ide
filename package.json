@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "concurrently -n \"SERVER,VITE\" -c \"magenta,cyan\" \"node server/index.js\" \"vite --host\"",
+    "dev": "concurrently -n \"SERVER,VITE\" -c \"magenta,cyan\" \"node --watch server/index.js\" \"vite --host\"",
     "server": "node server/index.js",
     "client": "vite",
     "build": "tsc -b && vite build",

@@ -66,6 +66,17 @@ export interface PlanTask {
   phase?: string;
 }
 
+export interface ExecutionPhase {
+  id: string;
+  number: number;
+  title: string;
+  description: string;
+  targetFiles: string[];
+  commands: string[];
+  status: 'pending' | 'in_progress' | 'completed' | 'error';
+  error?: string;
+}
+
 export interface ToolExecution {
   id: string;
   tool: 'read_file' | 'write_file' | 'terminal_command' | 'list_directory';

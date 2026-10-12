@@ -482,6 +482,251 @@ wss.on('connection', (ws) => {
 // ==========================================
 const activeGenerations = new Set();
 
+const OLLAMA_TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'write_file',
+      description: 'Create or update a file in the workspace directory with complete source code',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: {
+            type: 'string',
+            description: 'Relative path of the file to create or modify, e.g. "index.html", "script.js", "src/main.rs"',
+          },
+          content: {
+            type: 'string',
+            description: 'Complete source code content to write into the file',
+          },
+        },
+        required: ['path', 'content'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'run_terminal_command',
+      description: 'Run a shell command in the workspace directory, e.g. "npm init -y", "touch script.js", "cargo build"',
+      parameters: {
+        type: 'object',
+        properties: {
+          command: {
+            type: 'string',
+            description: 'The shell command to execute in the workspace',
+          },
+        },
+        required: ['command'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'read_file',
+      description: 'Read the contents of a file in the workspace',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: {
+            type: 'string',
+            description: 'Relative path of the file to read',
+          },
+        },
+        required: ['path'],
+      },
+    },
+  },
+];
+
+function writeWorkspaceFile(workspacePath, relPath, content) {
+  const cleanRel = relPath.replace(/^(\.\/|\/)/, '').trim();
+  const absPath = path.resolve(workspacePath, cleanRel);
+  if (!absPath.startsWith(path.resolve(workspacePath))) {
+    throw new Error(`Path security violation: ${relPath} escapes workspace`);
+  }
+  const dir = path.dirname(absPath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  fs.writeFileSync(absPath, content, 'utf8');
+  return { absPath, relPath: cleanRel, size: Buffer.byteLength(content) };
+}
+
+async function runWorkspaceCommand(workspacePath, command) {
+  const workingDir = workspacePath && fs.existsSync(workspacePath) ? workspacePath : process.cwd();
+  try {
+    const { stdout, stderr } = await execPromise(command, {
+      cwd: workingDir,
+      timeout: 120000,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+    return {
+      success: true,
+      exitCode: 0,
+      stdout: stdout || '',
+      stderr: stderr || '',
+      hasError: false,
+    };
+  } catch (err) {
+    return {
+      success: false,
+      exitCode: err.code || 1,
+      stdout: err.stdout || '',
+      stderr: err.stderr || err.message,
+      hasError: true,
+    };
+  }
+}
+
+function extractActionsFromText(text) {
+  const fileActions = [];
+  const bashActions = [];
+
+  // 1. Explicit ```file:filename.ext
+  const filePattern = /```(?:file|write|create):([^\n\r]+)[\r\n]([\s\S]*?)```/g;
+  let match;
+  while ((match = filePattern.exec(text)) !== null) {
+    const filePath = match[1].trim();
+    const content = match[2];
+    fileActions.push({ path: filePath, content });
+  }
+
+  // 2. Explicit ```bash:run or ```sh:run
+  const bashPattern = /```(?:bash|sh|cmd):run[\r\n]([\s\S]*?)```/g;
+  while ((match = bashPattern.exec(text)) !== null) {
+    const command = match[1].trim();
+    if (command) bashActions.push({ command });
+  }
+
+  // 3. Fallback Heuristic: standard code block preceded by filename (e.g. "create a new JavaScript file ( script.js ) to handle... ```javascript")
+  const heuristicPattern = /(?:create|file|in|named|modify|write|add)?\s*[`(]?([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]{1,8})[`)\]:]?\s*(?:to handle[^\n]*|:\s*)?\n+```(?:[a-zA-Z0-9_-]+)?\n([\s\S]*?)```/gi;
+  while ((match = heuristicPattern.exec(text)) !== null) {
+    const candidatePath = match[1].trim();
+    const code = match[2];
+    if (!candidatePath.includes(' ') && !fileActions.some((f) => f.path === candidatePath) && code.trim().length > 0) {
+      const ext = path.extname(candidatePath).toLowerCase();
+      if (['.js', '.ts', '.jsx', '.tsx', '.html', '.css', '.json', '.py', '.php', '.rs', '.vue', '.sh', '.md', '.sql'].includes(ext)) {
+        fileActions.push({ path: candidatePath, content: code });
+      }
+    }
+  }
+
+  // 4. Fallback Heuristic: JSON tool call emitted in text by smaller models
+  const jsonToolPattern = /\{\s*"name"\s*:\s*"write_file"\s*,\s*"arguments"\s*:\s*\{[\s\S]*?"path"\s*:\s*"([^"]+)"[\s\S]*?"content"\s*:\s*"([\s\S]*?)"\s*\}\s*\}/g;
+  while ((match = jsonToolPattern.exec(text)) !== null) {
+    const p = match[1];
+    let c = match[2];
+    try {
+      c = JSON.parse(`"${c}"`);
+    } catch (e) {}
+    if (!fileActions.some((f) => f.path === p)) {
+      fileActions.push({ path: p, content: c });
+    }
+  }
+
+  // 5. Code block with first line comment containing filename: e.g. // index.js or /* style.css */ or <!-- index.html -->
+  const blockWithCommentPattern = /```(?:[a-zA-Z0-9_-]+)?[\r\n]+(?:\/\/|#|<!--|\/\*)\s*([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]{1,8})(?:\s*-->|\s*\*\/)?[\r\n]([\s\S]*?)```/g;
+  while ((match = blockWithCommentPattern.exec(text)) !== null) {
+    const candidatePath = match[1].trim();
+    const code = match[2];
+    if (!candidatePath.includes(' ') && !fileActions.some((f) => f.path === candidatePath) && code.trim().length > 0) {
+      const ext = path.extname(candidatePath).toLowerCase();
+      if (['.js', '.ts', '.jsx', '.tsx', '.html', '.css', '.json', '.py', '.php', '.rs', '.vue', '.sh', '.md', '.sql'].includes(ext)) {
+        fileActions.push({ path: candidatePath, content: code });
+      }
+    }
+  }
+
+  // 6. Header or bold filename immediately before code block: e.g. ### `index.html`\n```html or **styles.css**\n```css
+  const headerOrBoldPattern = /(?:###?\s+|[*_]{1,2}|`)([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]{1,8})(?:[*_]{1,2}|`|:)?[\r\n]+```(?:[a-zA-Z0-9_-]+)?[\r\n]([\s\S]*?)```/g;
+  while ((match = headerOrBoldPattern.exec(text)) !== null) {
+    const candidatePath = match[1].trim();
+    const code = match[2];
+    if (!candidatePath.includes(' ') && !fileActions.some((f) => f.path === candidatePath) && code.trim().length > 0) {
+      const ext = path.extname(candidatePath).toLowerCase();
+      if (['.js', '.ts', '.jsx', '.tsx', '.html', '.css', '.json', '.py', '.php', '.rs', '.vue', '.sh', '.md', '.sql'].includes(ext)) {
+        fileActions.push({ path: candidatePath, content: code });
+      }
+    }
+  }
+
+  return { fileActions, bashActions };
+}
+
+function parsePhasesFromPlan(planMarkdown) {
+  const phases = [];
+  const phaseRegex = /#{1,4}\s+Phase\s+(\d+)[:\s]+([^\n]+)([\s\S]*?)(?=(?:#{1,4}\s+Phase\s+\d+|$))/gi;
+  let match;
+  while ((match = phaseRegex.exec(planMarkdown)) !== null) {
+    const num = parseInt(match[1], 10);
+    const title = match[2].trim();
+    const body = match[3] || '';
+
+    const fileMatches = body.match(/Target Files:?\s*([^\n]+)/i);
+    const targetFiles = fileMatches
+      ? fileMatches[1]
+          .split(/[,;]/)
+          .map((s) => s.replace(/[`*]/g, '').trim())
+          .filter(Boolean)
+      : [];
+
+    const cmdMatches = body.match(/Commands:?\s*([^\n]+)/i);
+    const commands = cmdMatches
+      ? cmdMatches[1]
+          .split(/[,;]/)
+          .map((s) => s.replace(/[`*]/g, '').trim())
+          .filter(Boolean)
+      : [];
+
+    phases.push({
+      id: `phase-${num}-${Date.now()}`,
+      number: num,
+      title,
+      description: body.trim(),
+      targetFiles,
+      commands,
+      status: 'pending',
+    });
+  }
+
+  // Fallback if model did not use "### Phase N:" syntax
+  if (phases.length === 0) {
+    phases.push(
+      {
+        id: `phase-1-${Date.now()}`,
+        number: 1,
+        title: 'Project Scaffolding & Setup',
+        description: 'Initialize configuration, directory layout, and boilerplate files',
+        targetFiles: [],
+        commands: [],
+        status: 'pending',
+      },
+      {
+        id: `phase-2-${Date.now()}`,
+        number: 2,
+        title: 'Core Implementation',
+        description: 'Implement core functionality, files, and styles',
+        targetFiles: [],
+        commands: [],
+        status: 'pending',
+      },
+      {
+        id: `phase-3-${Date.now()}`,
+        number: 3,
+        title: 'Verification & Polish',
+        description: 'Test, verify execution, and fix any errors',
+        targetFiles: [],
+        commands: [],
+        status: 'pending',
+      }
+    );
+  }
+
+  return phases;
+}
+
 app.post('/api/agent/stop', (req, res) => {
   let count = 0;
   for (const c of activeGenerations) {
@@ -494,8 +739,171 @@ app.post('/api/agent/stop', (req, res) => {
   res.json({ success: true, stopped: count });
 });
 
+// Endpoint: Generate Implementation Plan and write IMPLEMENTATION_PLAN.md to disk
+app.post('/api/agent/plan', async (req, res) => {
+  const { model, prompt, workspacePath } = req.body;
+  if (!model || !prompt) {
+    return res.status(400).json({ error: 'model and prompt are required' });
+  }
+
+  const targetWorkspace = workspacePath || process.cwd();
+  const tree = buildFileTree(targetWorkspace, 0, 2);
+  const fileListSnippet = tree.map((t) => (t.isDirectory ? `📁 ${t.name}/` : `📄 ${t.name}`)).join('\n');
+
+  const architectPrompt = `You are the Lead Software Architect of Antigravity IDE.
+Target workspace directory: ${targetWorkspace}
+Existing files in workspace:
+${fileListSnippet || '(Empty workspace)'}
+
+USER REQUEST:
+"${prompt}"
+
+Break this task down into 2 to 4 clear, logical, sequential PHASES.
+Your response MUST be a detailed Markdown Implementation Plan following this exact format:
+
+# Implementation Plan: ${prompt.slice(0, 50)}
+
+## Overview
+Brief architectural overview and technology stack choice.
+
+## Phased Execution Roadmap
+
+### Phase 1: [Phase Title]
+- **Goal:** [What this phase accomplishes]
+- **Target Files:** [Comma-separated file names to create, e.g. index.html, package.json]
+- **Commands:** [Comma-separated commands, if needed, e.g. npm init -y]
+- **Checklist:**
+- [ ] [Specific actionable step]
+- [ ] [Specific actionable step]
+
+### Phase 2: [Phase Title]
+- **Goal:** [What this phase accomplishes]
+- **Target Files:** [Comma-separated file names to create]
+- **Commands:** [Comma-separated commands]
+- **Checklist:**
+- [ ] [Specific actionable step]
+
+(Repeat for any remaining phases)`;
+
+  try {
+    const ollamaRes = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: 'user', content: architectPrompt }],
+        stream: false,
+        options: {
+          temperature: 0.2,
+          num_predict: 2048,
+        },
+      }),
+    });
+
+    if (!ollamaRes.ok) {
+      const err = await ollamaRes.text();
+      return res.status(500).json({ error: `Ollama error: ${err}` });
+    }
+
+    const data = await ollamaRes.json();
+    let planMarkdown = data.message?.content || '';
+    planMarkdown = planMarkdown.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+
+    // Write IMPLEMENTATION_PLAN.md directly to the workspace folder!
+    const planFileName = 'IMPLEMENTATION_PLAN.md';
+    const planFileAbs = path.join(targetWorkspace, planFileName);
+    fs.writeFileSync(planFileAbs, planMarkdown, 'utf8');
+
+    const phases = parsePhasesFromPlan(planMarkdown);
+
+    // Extract checklist tasks
+    const checklistMatches = [...planMarkdown.matchAll(/- \[[ xX]\]\s*([^\n]+)/g)];
+    const tasks = checklistMatches.map((m, idx) => ({
+      id: `task-${idx}-${Date.now()}`,
+      title: m[1].trim(),
+      completed: false,
+    }));
+
+    res.json({
+      success: true,
+      planMarkdown,
+      phases,
+      tasks,
+      planFilePath: planFileAbs,
+      planFileRelative: planFileName,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Endpoint: Verify workspace files for syntax, existence, and basic sanity
+app.post('/api/agent/verify', async (req, res) => {
+  const { workspacePath, files = [] } = req.body;
+  const targetWorkspace = workspacePath || process.cwd();
+  const results = [];
+
+  for (const f of files) {
+    const cleanRel = f.replace(/^(\.\/|\/)/, '').trim();
+    const absPath = path.resolve(targetWorkspace, cleanRel);
+    if (!fs.existsSync(absPath)) {
+      results.push({ path: cleanRel, exists: false, error: 'File does not exist' });
+      continue;
+    }
+    const stat = fs.statSync(absPath);
+    if (stat.size === 0) {
+      results.push({ path: cleanRel, exists: true, size: 0, error: 'File is empty (0 bytes)' });
+      continue;
+    }
+
+    const ext = path.extname(cleanRel).toLowerCase();
+    let syntaxError = null;
+
+    if (ext === '.json') {
+      try {
+        JSON.parse(fs.readFileSync(absPath, 'utf8'));
+      } catch (err) {
+        syntaxError = `Invalid JSON syntax: ${err.message}`;
+      }
+    } else if (ext === '.js' || ext === '.mjs') {
+      try {
+        await execPromise(`node --check "${absPath}"`, { cwd: targetWorkspace, timeout: 5000 });
+      } catch (err) {
+        syntaxError = `JavaScript syntax error: ${err.stderr || err.message}`;
+      }
+    } else if (ext === '.py') {
+      try {
+        await execPromise(`python3 -m py_compile "${absPath}"`, { cwd: targetWorkspace, timeout: 5000 });
+      } catch (err) {
+        syntaxError = `Python syntax error: ${err.stderr || err.message}`;
+      }
+    }
+
+    results.push({
+      path: cleanRel,
+      exists: true,
+      size: stat.size,
+      hasError: !!syntaxError,
+      error: syntaxError,
+    });
+  }
+
+  const hasAnyError = results.some((r) => r.hasError || !r.exists);
+  res.json({ success: true, verified: !hasAnyError, results });
+});
+
+// Endpoint: Stream Agent Response & Execute Tools / File Writes in Real-Time
 app.post('/api/agent/stream', async (req, res) => {
-  const { model, prompt, workspacePath, thinkingEnabled, mode, conversationHistory = [] } = req.body;
+  const {
+    model,
+    prompt,
+    workspacePath,
+    thinkingEnabled,
+    mode,
+    autoApplyFiles = true,
+    autoExecuteCommands = true,
+    conversationHistory = [],
+  } = req.body;
 
   if (!model || !prompt) {
     return res.status(400).json({ error: 'model and prompt are required' });
@@ -525,7 +933,6 @@ app.post('/api/agent/stream', async (req, res) => {
   });
 
   try {
-    // Provide repository context & tools schema in system prompt
     const targetWorkspace = workspacePath || process.cwd();
     const tree = buildFileTree(targetWorkspace, 0, 2);
     const fileListSnippet = tree.map((t) => (t.isDirectory ? `📁 ${t.name}/` : `📄 ${t.name}`)).join('\n');
@@ -538,46 +945,27 @@ app.post('/api/agent/stream', async (req, res) => {
         manifestInfo += `\npackage.json dependencies: ${JSON.stringify({ ...pkg.dependencies, ...pkg.devDependencies })}`;
       } catch (e) {}
     }
-    const composerPath = path.join(targetWorkspace, 'composer.json');
-    if (fs.existsSync(composerPath)) {
-      try {
-        const comp = JSON.parse(fs.readFileSync(composerPath, 'utf8'));
-        manifestInfo += `\ncomposer.json dependencies: ${JSON.stringify(comp.require)}`;
-      } catch (e) {}
-    }
 
     let systemInstruction = `You are the Autonomous Software Engineer of the Antigravity IDE.
-You are running on Linux Ubuntu with direct access to terminal execution and filesystem manipulation.
-Current workspace directory: ${targetWorkspace}
+You are running directly on Linux Ubuntu with access to write files and run terminal commands in:
+${targetWorkspace}
 
-Workspace File Tree:
+Current Files in Workspace:
 ${fileListSnippet || '(Empty workspace)'}
 ${manifestInfo}
 
-STRICT OPERATIONAL DIRECTIVES:
-1. NEVER instruct the user what commands to run or how to build things. Do NOT say "You can install...", "First you need to...", or "Here are the steps you should follow...". The user will NOT run anything manually.
-2. YOU must directly execute the work using actionable blocks.
-3. Every response MUST follow this structured workflow:
-
-### Implementation Plan
-Always start by identifying the clear steps as a checklist to maintain focus and prevent hallucinations:
-- [ ] Step 1: [Specific setup or scaffolding step]
-- [ ] Step 2: [Specific file or component to create/modify]
-- [ ] Step 3: [Build or verification step]
-
-### Actions
-Immediately emit the executable commands and file contents for the IDE to run and write:
-- To run terminal commands (scaffolding, installing packages, running migrations, building):
-\`\`\`bash:run
-command to run
-\`\`\`
-
-- To create or update files in the workspace:
+CRITICAL OPERATIONAL RULES:
+1. NEVER instruct the user to run commands or build files manually.
+2. Provide real, complete code without placeholders or omissions.
+3. Every file you describe MUST be written out using actionable code blocks or function tool calls:
 \`\`\`file:relative/path/to/file.ext
-[complete file code here]
+[complete code here]
 \`\`\`
-
-4. Provide real, complete code without placeholders. The IDE backend automatically runs your bash commands and writes your files to the disk.`;
+and terminal commands using:
+\`\`\`bash:run
+command to execute
+\`\`\`
+The Antigravity backend will automatically create the files on disk and execute the commands.`;
 
     if (thinkingEnabled) {
       systemInstruction += `\nInclude deep reasoning steps inside <think>...</think> tags before writing your answer.`;
@@ -591,21 +979,34 @@ command to run
 
     sendEvent('status', { status: 'Connecting to local LLM...' });
 
-    // Call Ollama streaming API with AbortSignal and max tokens
+    // Call Ollama streaming API with Tools (for supported models) & AbortSignal
+    const ollamaRequestBody = {
+      model,
+      messages,
+      stream: true,
+      options: {
+        temperature: 0.2,
+        num_predict: 4096,
+        stop: ['<|endoftext|>', '<|im_end|>', '\n\nUser:', '\n\nHuman:'],
+      },
+    };
+
+    // Only attach native tools for models that support it (e.g., granite, 7B+ qwen)
+    // Deepseek and <3B models work best with direct markdown extraction to prevent schema confusion
+    const modelLower = model.toLowerCase();
+    const supportsNativeTools =
+      (modelLower.includes('granite') || modelLower.includes('7b') || modelLower.includes('8b') || modelLower.includes('14b')) &&
+      !modelLower.includes('deepseek');
+
+    if (supportsNativeTools) {
+      ollamaRequestBody.tools = OLLAMA_TOOLS;
+    }
+
     const ollamaRes = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       signal: controller.signal,
-      body: JSON.stringify({
-        model,
-        messages,
-        stream: true,
-        options: {
-          temperature: 0.2,
-          num_predict: 3072,
-          stop: ['<|endoftext|>', '<|im_end|>', '\n\nUser:', '\n\nHuman:'],
-        },
-      }),
+      body: JSON.stringify(ollamaRequestBody),
     });
 
     if (!ollamaRes.ok) {
@@ -620,6 +1021,7 @@ command to run
     let accumulatedContent = '';
     let accumulatedThinking = '';
     let inThinkTag = false;
+    const collectedToolCalls = [];
 
     while (true) {
       if (controller.signal.aborted) {
@@ -638,15 +1040,20 @@ command to run
         try {
           const parsed = JSON.parse(line);
           const delta = parsed.message?.content || '';
-          
+
+          // Capture Ollama native tool calls
+          if (parsed.message?.tool_calls && Array.isArray(parsed.message.tool_calls)) {
+            for (const tc of parsed.message.tool_calls) {
+              collectedToolCalls.push(tc);
+              sendEvent('tool_call', tc);
+            }
+          }
+
           if (delta) {
             accumulatedContent += delta;
-            
-            // Check for <think> and </think> tags
+
             if (delta.includes('<think>')) inThinkTag = true;
-            if (inThinkTag) {
-              accumulatedThinking += delta;
-            }
+            if (inThinkTag) accumulatedThinking += delta;
             if (delta.includes('</think>')) inThinkTag = false;
 
             sendEvent('chunk', {
@@ -656,7 +1063,7 @@ command to run
           }
 
           if (parsed.done) {
-            sendEvent('done', {
+            sendEvent('stream_complete', {
               totalContent: accumulatedContent,
               totalDuration: parsed.total_duration,
               evalCount: parsed.eval_count,
@@ -665,6 +1072,77 @@ command to run
         } catch (e) {}
       }
     }
+
+    // ========================================================
+    // AUTO-EXECUTE ACTIONS & WRITE FILES TO DISK
+    // ========================================================
+    const writtenFiles = [];
+    const executedCommands = [];
+
+    // 1. Process native Ollama tool calls
+    for (const tc of collectedToolCalls) {
+      const fnName = tc.function?.name;
+      const args = tc.function?.arguments || {};
+      if (fnName === 'write_file' && args.path && args.content) {
+        try {
+          const resWrite = writeWorkspaceFile(targetWorkspace, args.path, args.content);
+          writtenFiles.push(resWrite);
+          sendEvent('file_written', {
+            path: resWrite.relPath,
+            fullPath: resWrite.absPath,
+            size: resWrite.size,
+            source: 'native_tool_call',
+          });
+        } catch (err) {
+          sendEvent('file_error', { path: args.path, error: err.message });
+        }
+      } else if (fnName === 'run_terminal_command' && args.command && autoExecuteCommands) {
+        sendEvent('command_started', { command: args.command });
+        const resCmd = await runWorkspaceCommand(targetWorkspace, args.command);
+        executedCommands.push({ command: args.command, ...resCmd });
+        sendEvent('command_executed', { command: args.command, ...resCmd });
+      }
+    }
+
+    // 2. Process markdown / heuristic action blocks from text (Fallback & Multi-format)
+    if (autoApplyFiles) {
+      const { fileActions, bashActions } = extractActionsFromText(accumulatedContent);
+
+      for (const fa of fileActions) {
+        if (!writtenFiles.some((w) => w.relPath === fa.path.replace(/^(\.\/|\/)/, ''))) {
+          try {
+            const resWrite = writeWorkspaceFile(targetWorkspace, fa.path, fa.content);
+            writtenFiles.push(resWrite);
+            sendEvent('file_written', {
+              path: resWrite.relPath,
+              fullPath: resWrite.absPath,
+              size: resWrite.size,
+              source: 'extracted_block',
+            });
+          } catch (err) {
+            sendEvent('file_error', { path: fa.path, error: err.message });
+          }
+        }
+      }
+
+      if (autoExecuteCommands) {
+        for (const ba of bashActions) {
+          if (!executedCommands.some((c) => c.command === ba.command)) {
+            sendEvent('command_started', { command: ba.command });
+            const resCmd = await runWorkspaceCommand(targetWorkspace, ba.command);
+            executedCommands.push({ command: ba.command, ...resCmd });
+            sendEvent('command_executed', { command: ba.command, ...resCmd });
+          }
+        }
+      }
+    }
+
+    // Send final done event with complete summary
+    sendEvent('done', {
+      totalContent: accumulatedContent,
+      writtenFiles,
+      executedCommands,
+    });
 
     res.end();
   } catch (err) {

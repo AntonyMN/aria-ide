@@ -1,4 +1,4 @@
-import type { LocalModel, SystemMemory, FileNode, ExecutionPhase, PlanTask } from '../types';
+import type { LocalModel, SystemMemory, FileNode, ExecutionPhase, PlanTask, WorkspaceSession, ActivityLogItem } from '../types';
 
 const API_BASE = 'http://localhost:3001/api';
 
@@ -173,6 +173,44 @@ export async function verifyWorkspaceFiles(params: {
   });
   if (!res.ok) throw new Error('Failed to verify workspace files');
   return res.json();
+}
+
+export async function fetchWorkspaceSession(dirPath: string): Promise<WorkspaceSession | null> {
+  try {
+    const res = await fetch(`${API_BASE}/workspace/session?path=${encodeURIComponent(dirPath)}`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.session || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+export async function saveWorkspaceSession(
+  workspacePath: string,
+  sessionData: Partial<WorkspaceSession>
+): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE}/workspace/session`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ workspacePath, sessionData }),
+    });
+    return res.ok;
+  } catch (e) {
+    return false;
+  }
+}
+
+export async function fetchWorkspaceActivity(dirPath: string): Promise<ActivityLogItem[]> {
+  try {
+    const res = await fetch(`${API_BASE}/workspace/activity?path=${encodeURIComponent(dirPath)}`);
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.activity || [];
+  } catch (e) {
+    return [];
+  }
 }
 
 

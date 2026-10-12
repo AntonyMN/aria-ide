@@ -237,7 +237,7 @@ app.get('/api/models', async (req, res) => {
 // ==========================================
 // 3. WORKSPACE & FILE SYSTEM MANIPULATION
 // ==========================================
-const IGNORED_DIRS = new Set(['.git', 'node_modules', 'dist', 'target', '.cache', '.gemini']);
+const IGNORED_DIRS = new Set(['.git', 'node_modules', 'dist', 'target', '.cache', '.gemini', '.ide']);
 
 function buildFileTree(dirPath, currentDepth = 0, maxDepth = 4) {
   if (currentDepth > maxDepth || !fs.existsSync(dirPath)) return [];
@@ -380,6 +380,42 @@ app.post('/api/workspace/delete', (req, res) => {
       }
     }
     res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Load workspace session (.ide/session.json)
+app.get('/api/workspace/session', (req, res) => {
+  const targetPath = req.query.path ? String(req.query.path) : process.cwd();
+  try {
+    const session = loadIdeSession(targetPath);
+    res.json({ success: true, session });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Save workspace session (.ide/session.json)
+app.post('/api/workspace/session', (req, res) => {
+  const { workspacePath, sessionData } = req.body;
+  if (!workspacePath || !sessionData) {
+    return res.status(400).json({ error: 'workspacePath and sessionData are required' });
+  }
+  try {
+    const ok = saveIdeSession(workspacePath, sessionData);
+    res.json({ success: ok });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get workspace activity log (.ide/activity.json)
+app.get('/api/workspace/activity', (req, res) => {
+  const targetPath = req.query.path ? String(req.query.path) : process.cwd();
+  try {
+    const activity = loadIdeActivity(targetPath);
+    res.json({ success: true, activity });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -552,6 +588,140 @@ function writeWorkspaceFile(workspacePath, relPath, content) {
   }
   fs.writeFileSync(absPath, content, 'utf8');
   return { absPath, relPath: cleanRel, size: Buffer.byteLength(content) };
+}
+
+function readWorkspaceFile(workspacePath, relPath) {
+  const cleanRel = relPath.replace(/^(\.\/|\/)/, '').trim();
+  const absPath = path.resolve(workspacePath, cleanRel);
+  if (!absPath.startsWith(path.resolve(workspacePath))) {
+    throw new Error(`Path security violation: ${relPath} escapes workspace`);
+  }
+  if (!fs.existsSync(absPath)) {
+    throw new Error(`File not found: ${cleanRel}`);
+  }
+  const stat = fs.statSync(absPath);
+  if (stat.isDirectory()) {
+    throw new Error(`Path is a directory: ${cleanRel}`);
+  }
+  const content = fs.readFileSync(absPath, 'utf8');
+  return { absPath, relPath: cleanRel, content, size: stat.size };
+}
+
+// ==========================================
+// .IDE PERSISTENCE & SESSION ENGINE
+// ==========================================
+function getIdeDir(workspacePath) {
+  const ideDir = path.join(workspacePath, '.ide');
+  if (!fs.existsSync(ideDir)) {
+    fs.mkdirSync(ideDir, { recursive: true });
+  }
+  return ideDir;
+}
+
+function loadIdeSession(workspacePath) {
+  try {
+    const sessionFile = path.join(workspacePath, '.ide', 'session.json');
+    if (fs.existsSync(sessionFile)) {
+      return JSON.parse(fs.readFileSync(sessionFile, 'utf8'));
+    }
+  } catch (e) {
+    console.error('Failed to load .ide/session.json:', e);
+  }
+  return null;
+}
+
+function saveIdeSession(workspacePath, sessionData) {
+  try {
+    const ideDir = getIdeDir(workspacePath);
+    const sessionFile = path.join(ideDir, 'session.json');
+    const dataToSave = {
+      version: '1.0',
+      updatedAt: new Date().toISOString(),
+      ...sessionData,
+    };
+    fs.writeFileSync(sessionFile, JSON.stringify(dataToSave, null, 2), 'utf8');
+    return true;
+  } catch (e) {
+    console.error('Failed to save .ide/session.json:', e);
+    return false;
+  }
+}
+
+function appendIdeActivity(workspacePath, activityItem) {
+  try {
+    const ideDir = getIdeDir(workspacePath);
+    const activityFile = path.join(ideDir, 'activity.json');
+    let activityLog = [];
+    if (fs.existsSync(activityFile)) {
+      try {
+        activityLog = JSON.parse(fs.readFileSync(activityFile, 'utf8'));
+      } catch (e) {}
+    }
+    const item = {
+      id: `act-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
+      timestamp: new Date().toISOString(),
+      ...activityItem,
+    };
+    activityLog.unshift(item);
+    if (activityLog.length > 200) activityLog = activityLog.slice(0, 200);
+    fs.writeFileSync(activityFile, JSON.stringify(activityLog, null, 2), 'utf8');
+
+    updateIdeContextMarkdown(workspacePath, activityLog);
+    return item;
+  } catch (e) {
+    console.error('Failed to append to .ide/activity.json:', e);
+  }
+}
+
+function loadIdeActivity(workspacePath) {
+  try {
+    const activityFile = path.join(workspacePath, '.ide', 'activity.json');
+    if (fs.existsSync(activityFile)) {
+      return JSON.parse(fs.readFileSync(activityFile, 'utf8'));
+    }
+  } catch (e) {}
+  return [];
+}
+
+function updateIdeContextMarkdown(workspacePath, activityLog = []) {
+  try {
+    const ideDir = getIdeDir(workspacePath);
+    const contextFile = path.join(ideDir, 'context.md');
+
+    const entries = fs.readdirSync(workspacePath, { withFileTypes: true });
+    const files = entries
+      .filter((e) => !e.isDirectory() && !e.name.startsWith('.'))
+      .map((e) => e.name);
+    const dirs = entries
+      .filter((e) => e.isDirectory() && !['node_modules', '.git', '.ide', 'dist'].includes(e.name))
+      .map((e) => e.name);
+
+    const recentActions = (activityLog || [])
+      .slice(0, 15)
+      .map((a) => {
+        if (a.type === 'file_written') return `- Created/Modified \`${a.path}\` (${a.size} bytes)`;
+        if (a.type === 'command_executed') return `- Executed \`${a.command}\` (exit code: ${a.exitCode})`;
+        if (a.type === 'phase_completed') return `- Completed Phase ${a.phaseNumber}: ${a.title}`;
+        if (a.type === 'plan_generated') return `- Generated Implementation Plan: ${a.title || ''}`;
+        return `- ${a.type}: ${JSON.stringify(a)}`;
+      })
+      .join('\n');
+
+    const content = `# Antigravity IDE Workspace Context
+**Workspace Path:** \`${workspacePath}\`
+**Last Updated:** ${new Date().toLocaleString()}
+
+## Project Layout
+- **Directories:** ${dirs.join(', ') || 'None'}
+- **Files:** ${files.join(', ') || 'None'}
+
+## Recent Workspace Activity Log
+${recentActions || 'No actions recorded yet.'}
+`;
+    fs.writeFileSync(contextFile, content, 'utf8');
+  } catch (e) {
+    console.error('Failed to update .ide/context.md:', e);
+  }
 }
 
 async function runWorkspaceCommand(workspacePath, command) {
@@ -824,6 +994,14 @@ Brief architectural overview and technology stack choice.
       completed: false,
     }));
 
+    appendIdeActivity(targetWorkspace, {
+      type: 'plan_generated',
+      title: prompt.slice(0, 80),
+      planFile: planFileName,
+      phasesCount: phases.length,
+      tasksCount: tasks.length,
+    });
+
     res.json({
       success: true,
       planMarkdown,
@@ -894,20 +1072,22 @@ app.post('/api/agent/verify', async (req, res) => {
 
 // Endpoint: Stream Agent Response & Execute Tools / File Writes in Real-Time
 app.post('/api/agent/stream', async (req, res) => {
-  const {
-    model,
-    prompt,
-    workspacePath,
-    thinkingEnabled,
-    mode,
-    autoApplyFiles = true,
-    autoExecuteCommands = true,
-    conversationHistory = [],
-  } = req.body;
+    const {
+      model,
+      prompt,
+      workspacePath,
+      thinkingEnabled,
+      mode,
+      activeFile,
+      openTabs = [],
+      autoApplyFiles = true,
+      autoExecuteCommands = true,
+      conversationHistory = [],
+    } = req.body;
 
-  if (!model || !prompt) {
-    return res.status(400).json({ error: 'model and prompt are required' });
-  }
+    if (!model || !prompt) {
+      return res.status(400).json({ error: 'model and prompt are required' });
+    }
 
   // Setup SSE streaming
   res.setHeader('Content-Type', 'text/event-stream');
@@ -946,18 +1126,65 @@ app.post('/api/agent/stream', async (req, res) => {
       } catch (e) {}
     }
 
+    // 1. Context from .ide/context.md
+    let ideContextSnippet = '';
+    const ideContextPath = path.join(targetWorkspace, '.ide', 'context.md');
+    if (fs.existsSync(ideContextPath)) {
+      try {
+        const ctxText = fs.readFileSync(ideContextPath, 'utf8');
+        ideContextSnippet = `\n--- RECENT WORKSPACE ACTIVITY (.ide) ---\n${ctxText.slice(0, 1500)}\n`;
+      } catch (e) {}
+    }
+
+    // 2. Direct File System Inspection: Top-level workspace code files
+    let existingFilesSnippet = '';
+    try {
+      const topEntries = fs.readdirSync(targetWorkspace, { withFileTypes: true });
+      const codeFiles = topEntries
+        .filter((e) => !e.isDirectory() && !e.name.startsWith('.') && e.name !== 'package-lock.json')
+        .slice(0, 10);
+
+      let collected = '';
+      for (const cf of codeFiles) {
+        const fPath = path.join(targetWorkspace, cf.name);
+        const stat = fs.statSync(fPath);
+        if (stat.size <= 20000) {
+          const content = fs.readFileSync(fPath, 'utf8');
+          collected += `\n--- File: ${cf.name} (${stat.size} bytes) ---\n${content}\n`;
+        }
+      }
+      if (collected) {
+        existingFilesSnippet = `\nCURRENT SOURCE FILES ON DISK IN WORKSPACE:\n${collected}`;
+      }
+    } catch (e) {}
+
+    // 3. Active Monaco Editor File (if provided)
+    let activeFileSnippet = '';
+    if (activeFile && activeFile.path && activeFile.content) {
+      activeFileSnippet = `\nCURRENTLY ACTIVE OPEN FILE IN MONACO EDITOR:
+Path: ${activeFile.path}
+Content:
+\`\`\`
+${activeFile.content.slice(0, 10000)}
+\`\`\`\n`;
+    }
+
     let systemInstruction = `You are the Autonomous Software Engineer of the Antigravity IDE.
-You are running directly on Linux Ubuntu with access to write files and run terminal commands in:
+You are running directly on Linux Ubuntu with full access to the project workspace at:
 ${targetWorkspace}
 
-Current Files in Workspace:
+Workspace Files:
 ${fileListSnippet || '(Empty workspace)'}
 ${manifestInfo}
+${ideContextSnippet}
+${existingFilesSnippet}
+${activeFileSnippet}
 
 CRITICAL OPERATIONAL RULES:
 1. NEVER instruct the user to run commands or build files manually.
 2. Provide real, complete code without placeholders or omissions.
-3. Every file you describe MUST be written out using actionable code blocks or function tool calls:
+3. You have full access to inspect, modify, and build workspace files.
+4. When writing code, use explicit blocks:
 \`\`\`file:relative/path/to/file.ext
 [complete code here]
 \`\`\`
@@ -1087,6 +1314,7 @@ The Antigravity backend will automatically create the files on disk and execute 
         try {
           const resWrite = writeWorkspaceFile(targetWorkspace, args.path, args.content);
           writtenFiles.push(resWrite);
+          appendIdeActivity(targetWorkspace, { type: 'file_written', path: resWrite.relPath, size: resWrite.size });
           sendEvent('file_written', {
             path: resWrite.relPath,
             fullPath: resWrite.absPath,
@@ -1100,7 +1328,21 @@ The Antigravity backend will automatically create the files on disk and execute 
         sendEvent('command_started', { command: args.command });
         const resCmd = await runWorkspaceCommand(targetWorkspace, args.command);
         executedCommands.push({ command: args.command, ...resCmd });
+        appendIdeActivity(targetWorkspace, {
+          type: 'command_executed',
+          command: args.command,
+          exitCode: resCmd.exitCode,
+          success: resCmd.success,
+        });
         sendEvent('command_executed', { command: args.command, ...resCmd });
+      } else if (fnName === 'read_file' && args.path) {
+        try {
+          const resRead = readWorkspaceFile(targetWorkspace, args.path);
+          sendEvent('file_read', { path: resRead.relPath, content: resRead.content, size: resRead.size });
+          appendIdeActivity(targetWorkspace, { type: 'file_read', path: resRead.relPath });
+        } catch (err) {
+          sendEvent('file_error', { path: args.path, error: err.message });
+        }
       }
     }
 
@@ -1113,6 +1355,7 @@ The Antigravity backend will automatically create the files on disk and execute 
           try {
             const resWrite = writeWorkspaceFile(targetWorkspace, fa.path, fa.content);
             writtenFiles.push(resWrite);
+            appendIdeActivity(targetWorkspace, { type: 'file_written', path: resWrite.relPath, size: resWrite.size });
             sendEvent('file_written', {
               path: resWrite.relPath,
               fullPath: resWrite.absPath,
@@ -1131,6 +1374,12 @@ The Antigravity backend will automatically create the files on disk and execute 
             sendEvent('command_started', { command: ba.command });
             const resCmd = await runWorkspaceCommand(targetWorkspace, ba.command);
             executedCommands.push({ command: ba.command, ...resCmd });
+            appendIdeActivity(targetWorkspace, {
+              type: 'command_executed',
+              command: ba.command,
+              exitCode: resCmd.exitCode,
+              success: resCmd.success,
+            });
             sendEvent('command_executed', { command: ba.command, ...resCmd });
           }
         }

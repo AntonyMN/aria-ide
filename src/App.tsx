@@ -22,6 +22,9 @@ import {
   stopAgentGeneration,
   generateImplementationPlan,
   verifyWorkspaceFiles,
+  fetchWorkspaceSession,
+  saveWorkspaceSession,
+  fetchWorkspaceActivity,
 } from './services/api';
 import { FileTree } from './components/FileTree';
 import { ModelSelectorModal } from './components/ModelSelectorModal';
@@ -209,12 +212,55 @@ export function App() {
     }
   };
 
-  const loadWorkspace = async (targetPath?: string) => {
+  const loadWorkspace = async (targetPath?: string, restoreSession = false) => {
     try {
       const path = targetPath || workspacePath;
       const res = await fetchFileTree(path);
       setFileTree(res.tree);
       setWorkspacePath(res.rootPath);
+
+      if (restoreSession) {
+        // Try restoring session from .ide/session.json
+        const session = await fetchWorkspaceSession(res.rootPath);
+        if (session) {
+          if (Array.isArray(session.messages) && session.messages.length > 0) {
+            setMessages(session.messages);
+          }
+          if (Array.isArray(session.planTasks) && session.planTasks.length > 0) {
+            setPlanTasks(session.planTasks);
+            setActiveDockTab('plan');
+          }
+          if (session.selectedModel) {
+            setSelectedModel(session.selectedModel);
+          }
+          if (Array.isArray(session.openTabs) && session.openTabs.length > 0) {
+            for (const t of session.openTabs) {
+              try {
+                const { content } = await readFileContent(t.path);
+                const name = t.path.split('/').pop() || t.path;
+                const newTab: OpenTab = {
+                  id: t.path,
+                  path: t.path,
+                  name,
+                  content,
+                  savedContent: content,
+                  isDirty: false,
+                  language: detectLanguage(t.path),
+                };
+                setTabs((prev) => {
+                  if (prev.some((old) => old.path === t.path)) return prev;
+                  return [...prev, newTab];
+                });
+              } catch (e) {}
+            }
+            if (session.activeFilePath) {
+              setActiveFilePath(session.activeFilePath);
+              setActiveTabId(session.activeFilePath);
+            }
+          }
+          showSuccessToast(`Session restored from .ide/ (${session.messages?.length || 0} messages)`);
+        }
+      }
     } catch (err) {
       console.error('Failed to load file tree:', err);
     }
@@ -222,7 +268,7 @@ export function App() {
 
   useEffect(() => {
     loadModelsAndHardware();
-    loadWorkspace();
+    loadWorkspace(undefined, true);
 
     // Poll memory periodically
     const interval = setInterval(async () => {
@@ -234,6 +280,29 @@ export function App() {
 
     return () => clearInterval(interval);
   }, []);
+
+  // Auto-save session to .ide/session.json whenever state changes (debounced)
+  const isInitialMountRef = useRef(true);
+  useEffect(() => {
+    if (isInitialMountRef.current) {
+      isInitialMountRef.current = false;
+      return;
+    }
+    const timer = setTimeout(() => {
+      if (workspacePath && (messages.length > 0 || planTasks.length > 0 || tabs.length > 0)) {
+        saveWorkspaceSession(workspacePath, {
+          workspacePath,
+          selectedModel,
+          activeFilePath,
+          openTabs: tabs.map((t) => ({ path: t.path, name: t.name })),
+          messages,
+          planTasks,
+        });
+      }
+    }, 1500);
+
+    return () => clearTimeout(timer);
+  }, [messages, planTasks, tabs, activeFilePath, selectedModel, workspacePath]);
 
   // Open file in editor tab
   const handleSelectFile = async (filePath: string, providedContent?: string) => {
@@ -400,7 +469,7 @@ export function App() {
     });
     if (newPath && newPath !== workspacePath) {
       setWorkspacePath(newPath);
-      loadWorkspace(newPath);
+      loadWorkspace(newPath, true);
       showSuccessToast('Workspace directory updated');
     }
   };
@@ -505,8 +574,9 @@ export function App() {
         workspacePath,
         thinkingEnabled: options.thinkingEnabled,
         autoApplyFiles: options.autoApplyFiles ?? true,
-        autoExecuteCommands: options.autoExecuteCommands ?? true,
-        conversationHistory: messages.slice(-4).map((m) => ({
+        activeFile: activeTab ? { path: activeTab.path, content: activeTab.content } : undefined,
+        openTabs: tabs.map((t) => ({ path: t.path, name: t.name })),
+        conversationHistory: messages.map((m) => ({
           role: m.role,
           content: m.content,
         })),
@@ -1160,6 +1230,10 @@ Please fix these syntax errors immediately. Provide corrected file content using
           </span>
           <span>Model: <strong>{selectedModel}</strong></span>
           {activeModelObj && <span>Est. RAM: <strong>{activeModelObj.ramEstimate.totalEstimatedGB} GB</strong></span>}
+          <span style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--accent-cyan)' }}>
+            <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--accent-cyan)' }}></span>
+            <span>Session Synced (.ide)</span>
+          </span>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
           <span>UTF-8</span>

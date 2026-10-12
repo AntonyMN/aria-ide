@@ -97,3 +97,28 @@ export interface ChatMessage {
   plan?: PlanTask[];
   timestamp: number;
 }
+
+export interface ActivityLogItem {
+  id: string;
+  timestamp: string;
+  type: 'file_written' | 'command_executed' | 'plan_generated' | 'phase_completed' | 'file_read';
+  path?: string;
+  size?: number;
+  command?: string;
+  exitCode?: number;
+  success?: boolean;
+  phaseNumber?: number;
+  title?: string;
+}
+
+export interface WorkspaceSession {
+  version?: string;
+  updatedAt?: string;
+  workspacePath?: string;
+  selectedModel?: string;
+  activeFilePath?: string;
+  openTabs?: { path: string; name: string }[];
+  messages?: ChatMessage[];
+  planTasks?: PlanTask[];
+}
+

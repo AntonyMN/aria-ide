@@ -1,4 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import type {
   ChatMessage,
   LocalModel,
@@ -10,16 +12,15 @@ import {
   Send,
   Brain,
   ListTodo,
-  Wrench,
   Terminal,
   FileEdit,
   ChevronDown,
   ChevronRight,
   Sparkles,
-  AlertCircle,
-  CheckCircle,
   Play,
   RotateCw,
+  Copy,
+  Check,
 } from 'lucide-react';
 import { runTerminalCommand, readFileContent } from '../services/api';
 
@@ -36,6 +37,98 @@ interface Props {
   onApplyPlan: (plan: PlanTask[]) => void;
   onFileSavedOrCreated: () => void;
 }
+
+// Subcomponent for fenced code blocks with Copy button and custom interactive actions
+const CodeBlock: React.FC<{
+  className?: string;
+  children: React.ReactNode;
+  onReviewFile: (filePath: string, content: string) => void;
+  onExecuteCommand: (command: string) => void;
+}> = ({ className, children, onReviewFile, onExecuteCommand }) => {
+  const [copied, setCopied] = useState(false);
+  const rawCode = String(children).replace(/\n$/, '');
+
+  // Check for custom action headers like language-file:path/to/file or language-bash:run
+  const match = /language-(\S+)/.exec(className || '');
+  const lang = match ? match[1] : '';
+
+  if (lang.startsWith('file:')) {
+    const filePath = lang.replace('file:', '').trim();
+    return (
+      <div className="tool-pill" style={{ flexDirection: 'column', alignItems: 'stretch', margin: '10px 0', gap: 8 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <FileEdit size={14} color="var(--accent-cyan)" />
+            <span style={{ fontWeight: 600 }}>Proposed File: <code>{filePath}</code></span>
+          </div>
+          <button
+            className="btn-accept"
+            style={{ padding: '3px 10px', fontSize: 11 }}
+            onClick={() => onReviewFile(filePath, rawCode)}
+          >
+            Review Diff & Apply
+          </button>
+        </div>
+        <div style={{
+          maxHeight: 160,
+          overflowY: 'auto',
+          background: 'rgba(0, 0, 0, 0.4)',
+          padding: 8,
+          borderRadius: 6,
+          fontFamily: 'var(--font-mono)',
+          fontSize: 11.5,
+          color: '#cbd5e1'
+        }}>
+          <pre>{rawCode}</pre>
+        </div>
+      </div>
+    );
+  }
+
+  if (lang === 'bash:run') {
+    return (
+      <div className="tool-pill" style={{ justifyContent: 'space-between', margin: '8px 0', alignItems: 'center' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <Terminal size={14} color="var(--accent-amber)" />
+          <span>Execute: <code style={{ color: 'var(--accent-amber)' }}>{rawCode}</code></span>
+        </div>
+        <button
+          className="send-btn"
+          style={{ padding: '3px 10px', fontSize: 11 }}
+          onClick={() => onExecuteCommand(rawCode)}
+        >
+          <Play size={11} /> Run Now
+        </button>
+      </div>
+    );
+  }
+
+  const handleCopy = () => {
+    navigator.clipboard.writeText(rawCode);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  return (
+    <div className="markdown-code-block">
+      <div className="markdown-code-header">
+        <span>{lang || 'code'}</span>
+        <button
+          className="icon-btn"
+          style={{ fontSize: 11, display: 'flex', alignItems: 'center', gap: 4, padding: '2px 6px' }}
+          onClick={handleCopy}
+          title="Copy code"
+        >
+          {copied ? <Check size={12} color="var(--accent-emerald)" /> : <Copy size={12} />}
+          <span>{copied ? 'Copied' : 'Copy'}</span>
+        </button>
+      </div>
+      <div className="markdown-code-content">
+        <pre>{rawCode}</pre>
+      </div>
+    </div>
+  );
+};
 
 export const AgentChatPane: React.FC<Props> = ({
   messages,
@@ -66,18 +159,6 @@ export const AgentChatPane: React.FC<Props> = ({
     if (!inputPrompt.trim() || isStreaming) return;
     onSendMessage(inputPrompt, { thinkingEnabled, mode });
     setInputPrompt('');
-  };
-
-  // Helper to extract file modifications and bash commands from raw markdown text
-  const extractActions = (content: string) => {
-    const fileMatches = [
-      ...content.matchAll(/```(?:file:([^\n]+))\n([\s\S]*?)```/g),
-    ];
-    const bashMatches = [
-      ...content.matchAll(/```(?:bash:run)\n([\s\S]*?)```/g),
-    ];
-
-    return { fileMatches, bashMatches };
   };
 
   const handleReviewFileChange = async (filePath: string, newContent: string) => {
@@ -117,6 +198,11 @@ export const AgentChatPane: React.FC<Props> = ({
     } catch (e) {}
   };
 
+  // Clean raw message content by stripping unclosed or raw <think> tags for markdown display
+  const sanitizeMarkdown = (content: string) => {
+    return content.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+  };
+
   return (
     <div className="ide-ai-panel">
       <div className="ai-header">
@@ -136,13 +222,13 @@ export const AgentChatPane: React.FC<Props> = ({
               Local AI Session Ready
             </p>
             <p style={{ fontSize: 12 }}>
-              Ask to inspect code, create implementation plans, propose edits, or run terminal commands.
+              Ask to inspect code, create implementation plans, propose edits, or run terminal commands. Responses will be rendered in formatted Markdown.
             </p>
           </div>
         )}
 
         {messages.map((msg) => {
-          const { fileMatches, bashMatches } = extractActions(msg.content);
+          const displayContent = sanitizeMarkdown(msg.content);
 
           return (
             <div
@@ -174,57 +260,33 @@ export const AgentChatPane: React.FC<Props> = ({
                 </div>
               )}
 
-              {/* Message text */}
-              <div style={{ whiteSpace: 'pre-wrap', lineHeight: 1.6 }}>
-                {msg.content}
-              </div>
-
-              {/* Detected File Edit Actions */}
-              {fileMatches.length > 0 && (
-                <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 6 }}>
-                  {fileMatches.map((m, idx) => {
-                    const filePath = m[1].trim();
-                    const newContent = m[2];
-                    return (
-                      <div key={idx} className="tool-pill" style={{ justifyContent: 'space-between' }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                          <FileEdit size={14} color="var(--accent-cyan)" />
-                          <span>Proposed Edit: <strong>{filePath}</strong></span>
-                        </div>
-                        <button
-                          className="btn-accept"
-                          style={{ padding: '3px 8px', fontSize: 11 }}
-                          onClick={() => handleReviewFileChange(filePath, newContent)}
-                        >
-                          Review Diff
-                        </button>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-
-              {/* Detected Terminal Command Actions */}
-              {bashMatches.length > 0 && (
-                <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
-                  {bashMatches.map((m, idx) => {
-                    const cmd = m[1].trim();
-                    return (
-                      <div key={idx} className="tool-pill" style={{ justifyContent: 'space-between' }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                          <Terminal size={14} color="var(--accent-amber)" />
-                          <span>Run: <code>{cmd}</code></span>
-                        </div>
-                        <button
-                          className="send-btn"
-                          style={{ padding: '3px 8px', fontSize: 11 }}
-                          onClick={() => handleExecuteCommand(cmd)}
-                        >
-                          <Play size={11} /> Execute
-                        </button>
-                      </div>
-                    );
-                  })}
+              {/* Formatted Markdown Content */}
+              {msg.role === 'user' ? (
+                <div style={{ whiteSpace: 'pre-wrap', lineHeight: 1.6 }}>{msg.content}</div>
+              ) : (
+                <div className="markdown-body">
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm]}
+                    components={{
+                      code({ node, className, children, ...props }: any) {
+                        const isInline = !className && typeof children === 'string' && !children.includes('\n');
+                        if (isInline) {
+                          return <code className="markdown-inline-code" {...props}>{children}</code>;
+                        }
+                        return (
+                          <CodeBlock
+                            className={className}
+                            onReviewFile={handleReviewFileChange}
+                            onExecuteCommand={handleExecuteCommand}
+                          >
+                            {children}
+                          </CodeBlock>
+                        );
+                      },
+                    }}
+                  >
+                    {displayContent || (msg.isStreaming ? 'Thinking...' : '')}
+                  </ReactMarkdown>
                 </div>
               )}
             </div>

@@ -7,6 +7,7 @@ import type {
   ToolExecution,
   DiffProposal,
   PlanTask,
+  ActivePlanExecution,
 } from '../types';
 import {
   Send,
@@ -26,6 +27,7 @@ import {
   AlertTriangle,
   Square,
   FileCode,
+  Pause,
 } from 'lucide-react';
 import { runTerminalCommand, readFileContent, saveFileContent } from '../services/api';
 import { promptText } from '../services/alerts';
@@ -45,6 +47,9 @@ interface Props {
   onFileSavedOrCreated: (createdFilePath?: string) => void;
   width?: number;
   getOriginalContent?: (filePath: string) => string | undefined;
+  activePlan?: ActivePlanExecution | null;
+  onProceedNextPhase?: () => void;
+  onSkipPhase?: () => void;
 }
 
 // Subcomponent for fenced code blocks with Copy button and custom interactive actions
@@ -208,6 +213,9 @@ export const AgentChatPane: React.FC<Props> = ({
   onFileSavedOrCreated,
   width,
   getOriginalContent,
+  activePlan,
+  onProceedNextPhase,
+  onSkipPhase,
 }) => {
   const [inputPrompt, setInputPrompt] = useState('');
   const [thinkingEnabled, setThinkingEnabled] = useState(true);
@@ -590,6 +598,53 @@ export const AgentChatPane: React.FC<Props> = ({
         <div ref={messagesEndRef} />
       </div>
 
+      {/* Phase Breather & Proceed Banner (Pauses between phases to let LLM breathe) */}
+      {activePlan && activePlan.status === 'paused' && activePlan.phases[activePlan.currentPhaseIndex] && (
+        <div className="phase-breather-banner">
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 3, flex: 1, minWidth: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <span className="badge badge-safe" style={{ fontSize: 10, padding: '2px 6px', display: 'flex', alignItems: 'center', gap: 4 }}>
+                <Pause size={10} /> Paused for Breather
+              </span>
+              <span style={{ fontSize: 11, color: 'var(--text-dim)' }}>
+                Phase {activePlan.currentPhaseIndex} of {activePlan.phases.length} complete
+              </span>
+            </div>
+            <div style={{
+              fontSize: 12.5,
+              fontWeight: 600,
+              color: 'var(--text-main)',
+              whiteSpace: 'nowrap',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+            }}>
+              Next: Phase {activePlan.currentPhaseIndex + 1}: {activePlan.phases[activePlan.currentPhaseIndex].title}
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            {onSkipPhase && (
+              <button
+                className="btn-skip-phase"
+                onClick={onSkipPhase}
+                title="Skip this phase and proceed to next"
+              >
+                Skip
+              </button>
+            )}
+            {onProceedNextPhase && (
+              <button
+                className="btn-proceed-phase"
+                onClick={onProceedNextPhase}
+                title={`Run Phase ${activePlan.currentPhaseIndex + 1}`}
+              >
+                <Play size={12} fill="currentColor" /> Proceed to Phase {activePlan.currentPhaseIndex + 1}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Input bar */}
       <div className="ai-input-bar">
         <div className="ai-controls">
@@ -647,7 +702,11 @@ export const AgentChatPane: React.FC<Props> = ({
         <div style={{ display: 'flex', gap: 8 }}>
           <textarea
             className="ai-textarea"
-            placeholder="Tell the AI what to build or modify... (it will plan, generate files, and run commands)"
+            placeholder={
+              activePlan && activePlan.status === 'paused' && activePlan.phases[activePlan.currentPhaseIndex]
+                ? `Type 'proceed' to start Phase ${activePlan.currentPhaseIndex + 1}, or ask a question / customize...`
+                : "Tell the AI what to build or modify... (it will plan, generate files, and run commands)"
+            }
             value={inputPrompt}
             onChange={(e) => setInputPrompt(e.target.value)}
             onKeyDown={(e) => {

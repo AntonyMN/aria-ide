@@ -8,6 +8,7 @@ import type {
   DiffProposal,
   PlanTask,
   ExecutionPhase,
+  ActivePlanExecution,
   ChatMessage,
 } from './types';
 import {
@@ -83,6 +84,7 @@ export function App() {
 
   // Implementation Plan State
   const [planTasks, setPlanTasks] = useState<PlanTask[]>([]);
+  const [activePlan, setActivePlan] = useState<ActivePlanExecution | null>(null);
 
   // Agent Chat State
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -265,6 +267,9 @@ export function App() {
               setActiveTabId(session.activeFilePath);
             }
           }
+          if (session.activePlan) {
+            setActivePlan(session.activePlan);
+          }
           showSuccessToast(`Session restored from .ide/ (${session.messages?.length || 0} messages)`);
         }
       }
@@ -296,7 +301,7 @@ export function App() {
       return;
     }
     const timer = setTimeout(() => {
-      if (workspacePath && (messages.length > 0 || planTasks.length > 0 || tabs.length > 0)) {
+      if (workspacePath && (messages.length > 0 || planTasks.length > 0 || tabs.length > 0 || activePlan)) {
         saveWorkspaceSession(workspacePath, {
           workspacePath,
           selectedModel,
@@ -304,12 +309,13 @@ export function App() {
           openTabs: tabs.map((t) => ({ path: t.path, name: t.name })),
           messages,
           planTasks,
+          activePlan,
         });
       }
     }, 1500);
 
     return () => clearTimeout(timer);
-  }, [messages, planTasks, tabs, activeFilePath, selectedModel, workspacePath]);
+  }, [messages, planTasks, activePlan, tabs, activeFilePath, selectedModel, workspacePath]);
 
   // Open file in editor tab
   const handleSelectFile = async (filePath: string, providedContent?: string) => {
@@ -481,6 +487,7 @@ export function App() {
       setActiveTabId('');
       setMessages([]);
       setPlanTasks([]);
+      setActivePlan(null);
       await loadWorkspace(newPath, true);
       setIsWorkspaceModalOpen(false);
     } catch (err: any) {
@@ -707,6 +714,180 @@ export function App() {
     return { totalContent, writtenFiles, executedCommands };
   };
 
+  // Autonomous Verification & Error-Checking on workspace files
+  const runFinalVerification = async () => {
+    try {
+      const treeRes = await fetchFileTree(workspacePath);
+      const workspaceFileNames = treeRes.tree
+        .filter((f) => !f.isDirectory && f.name !== 'IMPLEMENTATION_PLAN.md')
+        .map((f) => f.name);
+
+      if (workspaceFileNames.length > 0) {
+        const verifyRes = await verifyWorkspaceFiles({
+          workspacePath,
+          files: workspaceFileNames,
+        });
+
+        if (verifyRes.verified) {
+          showSuccessToast('All workspace files verified successfully (0 syntax errors)');
+        }
+      }
+    } catch (vErr) {
+      console.error('Verification error:', vErr);
+    }
+  };
+
+  // Helper to execute an individual phase of an active plan
+  const executePhase = async (
+    plan: ActivePlanExecution,
+    phaseIndex: number,
+    thinkingEnabled: boolean
+  ) => {
+    if (abortControllerRef.current?.signal.aborted) return;
+    if (phaseIndex >= plan.phases.length) {
+      setActivePlan({ ...plan, status: 'completed' });
+      await runFinalVerification();
+      return;
+    }
+
+    const phase = plan.phases[phaseIndex];
+    const phaseMsgId = `phase-${phase.number}-${Date.now()}`;
+
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: phaseMsgId,
+        role: 'assistant',
+        content: `🚀 **Phase ${phase.number}/${plan.phases.length}: ${phase.title}**\n\n*Target Files:* ${phase.targetFiles.join(', ') || 'Auto-detected'}\n*Commands:* ${phase.commands.join(', ') || 'Auto-detected'}\n\n`,
+        thinking: '',
+        isStreaming: true,
+        timestamp: Date.now(),
+      },
+    ]);
+
+    const phasePrompt = `We are executing Phase ${phase.number} of ${plan.phases.length} for: "${plan.prompt}".
+PHASE TITLE: ${phase.title}
+
+GOAL & SPECIFICATIONS:
+${phase.description}
+
+TARGET FILES TO CREATE OR UPDATE:
+${phase.targetFiles.length > 0 ? phase.targetFiles.map((f) => `- ${f}`).join('\n') : 'Create or update necessary files'}
+
+COMMANDS TO RUN:
+${phase.commands.length > 0 ? phase.commands.map((c) => `- ${c}`).join('\n') : 'None or run setup/build commands'}
+
+CRITICAL INSTRUCTIONS:
+- Write the complete code for all files needed for this phase.
+- Use explicit markdown code blocks:
+\`\`\`file:relative/path/to/file.ext
+[full complete code here]
+\`\`\`
+- Or call the native write_file tool.
+- If commands are needed, use:
+\`\`\`bash:run
+command to execute
+\`\`\`
+- Or call the native run_terminal_command tool.
+- Antigravity IDE will automatically write files to disk, sync Monaco Editor, and execute commands.`;
+
+    try {
+      const phaseResult = await streamAgentTask(phasePrompt, phaseMsgId, {
+        thinkingEnabled,
+        onFileWritten: (file) => {
+          loadWorkspace();
+          handleSelectFile(file.fullPath);
+          showSuccessToast(`Created/Updated ${file.path}`);
+        },
+        onCommandExecuted: async (cmd) => {
+          if (cmd.hasError) {
+            showWarningAlert('Command Error', `Command "${cmd.command}" failed.`);
+          }
+        },
+      });
+
+      // Mark checklist tasks completed for this phase
+      setPlanTasks((prev) =>
+        prev.map((t, idx) => {
+          if (idx < (phaseIndex + 1) * Math.ceil(prev.length / plan.phases.length)) {
+            return { ...t, completed: true };
+          }
+          return t;
+        })
+      );
+
+      const isLastPhase = phaseIndex === plan.phases.length - 1;
+
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === phaseMsgId
+            ? {
+                ...m,
+                content:
+                  m.content +
+                  `\n\n✅ **Phase ${phase.number} Complete!** (${phaseResult.writtenFiles.length} files written, ${phaseResult.executedCommands.length} commands run)` +
+                  (isLastPhase
+                    ? '\n\n🎉 **All phases have been executed!** Running final workspace verification...'
+                    : `\n\n⏸️ **System Paused.** Local LLM taking a breather to keep memory and CPU cool.\n*Ready for Phase ${phase.number + 1}: ${plan.phases[phaseIndex + 1]?.title || 'Next Phase'}? Click **Proceed to Phase ${phase.number + 1}** above or type in chat to continue.*`),
+                isStreaming: false,
+              }
+            : m
+        )
+      );
+
+      if (isLastPhase) {
+        setActivePlan({ ...plan, status: 'completed' });
+        showSuccessToast('All implementation plan phases completed!');
+        await runFinalVerification();
+      } else {
+        // PAUSE HERE as requested: LLM takes a breather and waits for user confirmation
+        const updatedPlan: ActivePlanExecution = {
+          ...plan,
+          currentPhaseIndex: phaseIndex + 1,
+          status: 'paused',
+        };
+        setActivePlan(updatedPlan);
+        showSuccessToast(`Phase ${phase.number} complete. System paused for review.`);
+      }
+    } catch (err: any) {
+      setActivePlan((prev) => (prev ? { ...prev, status: 'error' } : null));
+      showErrorAlert('Phase Execution Error', err.message || 'Error occurred');
+    } finally {
+      setIsStreaming(false);
+    }
+  };
+
+  // User proceeds to next phase
+  const handleProceedNextPhase = async () => {
+    if (!activePlan || activePlan.status !== 'paused') return;
+    const nextIdx = activePlan.currentPhaseIndex;
+    if (nextIdx >= activePlan.phases.length) return;
+
+    const nextPhase = activePlan.phases[nextIdx];
+    showSuccessToast(`Resuming: Starting Phase ${nextPhase.number}...`);
+
+    setActivePlan({ ...activePlan, status: 'executing' });
+    setIsStreaming(true);
+
+    // Give a brief 800ms breather cooldown for memory garbage collection
+    await new Promise((r) => setTimeout(r, 800));
+
+    await executePhase(activePlan, nextIdx, true);
+  };
+
+  // User skips a phase
+  const handleSkipPhase = () => {
+    if (!activePlan) return;
+    const nextIdx = activePlan.currentPhaseIndex + 1;
+    if (nextIdx >= activePlan.phases.length) {
+      setActivePlan({ ...activePlan, status: 'completed' });
+      showSuccessToast('Plan finished (remaining phases skipped)');
+    } else {
+      setActivePlan({ ...activePlan, currentPhaseIndex: nextIdx, status: 'paused' });
+      showSuccessToast(`Skipped to Phase ${activePlan.phases[nextIdx].number}`);
+    }
+  };
+
   // Agent Chat Streaming Handler: Autonomous Phased Pipeline
   const handleSendMessage = async (
     prompt: string,
@@ -716,6 +897,22 @@ export function App() {
       await showWarningAlert('Model Required', 'Please select a local AI model from the top model selector first.');
       setIsModelModalOpen(true);
       return;
+    }
+
+    // Check if system is currently paused after a phase and user inputs confirmation
+    if (activePlan && activePlan.status === 'paused') {
+      const trimmed = prompt.trim();
+      if (/^(proceed|continue|next|go|yes|run|ok|start)\b/i.test(trimmed)) {
+        const userMsg: ChatMessage = {
+          id: `msg-${Date.now()}`,
+          role: 'user',
+          content: prompt,
+          timestamp: Date.now(),
+        };
+        setMessages((prev) => [...prev, userMsg]);
+        await handleProceedNextPhase();
+        return;
+      }
     }
 
     const userMsg: ChatMessage = {
@@ -797,195 +994,24 @@ export function App() {
             m.id === planMsgId
               ? {
                   ...m,
-                  content: `📋 **Implementation Plan generated!**\n\nThe plan has been written to \`IMPLEMENTATION_PLAN.md\` and opened in Monaco Editor.\n\n${planResult.planMarkdown}\n\n---\n*Starting phased execution queue (${planResult.phases.length} phases)...*`,
+                  content: `📋 **Implementation Plan generated!**\n\nThe plan has been written to \`IMPLEMENTATION_PLAN.md\` and opened in Monaco Editor.\n\n${planResult.planMarkdown}\n\n---\n*Starting Phase 1 (${planResult.phases.length} phases total). System will pause after each phase for user review.*`,
                   isStreaming: false,
                 }
               : m
           )
         );
 
-        // Step 2: Queue phases sequentially, starting from phase 1 to completion
-        const allCreatedFiles: string[] = [];
+        // Step 2: Initialize activePlan state and run Phase 1 (will pause after Phase 1)
+        const newPlanState: ActivePlanExecution = {
+          prompt,
+          phases: planResult.phases,
+          currentPhaseIndex: 0,
+          status: 'executing',
+          autoProceed: false,
+        };
+        setActivePlan(newPlanState);
 
-        for (let i = 0; i < planResult.phases.length; i++) {
-          if (abortControllerRef.current?.signal.aborted) break;
-
-          const phase = planResult.phases[i];
-          const phaseMsgId = `phase-${phase.number}-${Date.now()}`;
-
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: phaseMsgId,
-              role: 'assistant',
-              content: `🚀 **Phase ${phase.number}/${planResult.phases.length}: ${phase.title}**\n\n*Target Files:* ${phase.targetFiles.join(', ') || 'Auto-detected'}\n*Commands:* ${phase.commands.join(', ') || 'Auto-detected'}\n\n`,
-              thinking: '',
-              isStreaming: true,
-              timestamp: Date.now(),
-            },
-          ]);
-
-          const phasePrompt = `We are executing Phase ${phase.number} of ${planResult.phases.length} for: "${prompt}".
-PHASE TITLE: ${phase.title}
-
-GOAL & SPECIFICATIONS:
-${phase.description}
-
-TARGET FILES TO CREATE OR UPDATE:
-${phase.targetFiles.length > 0 ? phase.targetFiles.map((f) => `- ${f}`).join('\n') : 'Create or update necessary files'}
-
-COMMANDS TO RUN:
-${phase.commands.length > 0 ? phase.commands.map((c) => `- ${c}`).join('\n') : 'None or run setup/build commands'}
-
-CRITICAL INSTRUCTIONS:
-- Write the complete code for all files needed for this phase.
-- Use explicit markdown code blocks:
-\`\`\`file:relative/path/to/file.ext
-[full complete code here]
-\`\`\`
-- Or call the native write_file tool.
-- If commands are needed, use:
-\`\`\`bash:run
-command to execute
-\`\`\`
-- Or call the native run_terminal_command tool.
-- Antigravity IDE will automatically write files to disk, sync Monaco Editor, and execute commands.`;
-
-          const phaseResult = await streamAgentTask(phasePrompt, phaseMsgId, {
-            thinkingEnabled: options.thinkingEnabled,
-            onFileWritten: (file) => {
-              allCreatedFiles.push(file.fullPath);
-              loadWorkspace();
-              handleSelectFile(file.fullPath);
-              showSuccessToast(`Created/Updated ${file.path}`);
-            },
-            onCommandExecuted: async (cmd) => {
-              // Autonomous Verification & Error-Checking Loop
-              if (cmd.hasError) {
-                showWarningAlert('Command Error', `Command "${cmd.command}" failed. Initiating self-correction...`);
-                const fixPrompt = `Command failed during Phase ${phase.number}:
-Command: ${cmd.command}
-Exit code: ${cmd.exitCode}
-Error: ${cmd.stderr || cmd.stdout}
-
-Please diagnose this error and provide immediate self-correction using \`\`\`file:path or \`\`\`bash:run to resolve it.`;
-
-                const fixMsgId = `fix-${Date.now()}`;
-                setMessages((p) => [
-                  ...p,
-                  {
-                    id: fixMsgId,
-                    role: 'assistant',
-                    content: `⚠️ **Self-Correction for command failure:**\n\n`,
-                    isStreaming: true,
-                    timestamp: Date.now(),
-                  },
-                ]);
-
-                await streamAgentTask(fixPrompt, fixMsgId, {
-                  thinkingEnabled: false,
-                  onFileWritten: (f) => {
-                    allCreatedFiles.push(f.fullPath);
-                    loadWorkspace();
-                    handleSelectFile(f.fullPath);
-                  },
-                });
-
-                setMessages((p) =>
-                  p.map((m) => (m.id === fixMsgId ? { ...m, isStreaming: false } : m))
-                );
-              }
-            },
-          });
-
-          // Mark checklist tasks completed for this phase
-          setPlanTasks((prev) =>
-            prev.map((t, idx) => {
-              if (idx < (i + 1) * Math.ceil(prev.length / planResult.phases.length)) {
-                return { ...t, completed: true };
-              }
-              return t;
-            })
-          );
-
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.id === phaseMsgId
-                ? {
-                    ...m,
-                    content:
-                      m.content +
-                      `\n\n✅ **Phase ${phase.number} Complete!** (${phaseResult.writtenFiles.length} files written, ${phaseResult.executedCommands.length} commands run)`,
-                    isStreaming: false,
-                  }
-                : m
-            )
-          );
-        }
-
-        // Step 3: Verification & Error-Checking Loop on created files
-        if (!abortControllerRef.current?.signal.aborted) {
-          const treeRes = await fetchFileTree(workspacePath);
-          const workspaceFileNames = treeRes.tree
-            .filter((f) => !f.isDirectory && f.name !== 'IMPLEMENTATION_PLAN.md')
-            .map((f) => f.name);
-
-          if (workspaceFileNames.length > 0) {
-            try {
-              const verifyRes = await verifyWorkspaceFiles({
-                workspacePath,
-                files: workspaceFileNames,
-              });
-
-              if (!verifyRes.verified) {
-                const errorFiles = verifyRes.results.filter((r) => r.hasError || !r.exists);
-                const fixPrompt = `Syntax or validation errors detected in workspace files:
-${errorFiles.map((e) => `- ${e.path}: ${e.error}`).join('\n')}
-
-Please fix these syntax errors immediately. Provide corrected file content using \`\`\`file:path.`;
-
-                const fixMsgId = `verify-fix-${Date.now()}`;
-                setMessages((p) => [
-                  ...p,
-                  {
-                    id: fixMsgId,
-                    role: 'assistant',
-                    content: `🛠️ **Self-Healing Syntax Errors:**\n\n`,
-                    isStreaming: true,
-                    timestamp: Date.now(),
-                  },
-                ]);
-
-                await streamAgentTask(fixPrompt, fixMsgId, {
-                  thinkingEnabled: false,
-                  onFileWritten: (f) => {
-                    loadWorkspace();
-                    handleSelectFile(f.fullPath);
-                  },
-                });
-
-                setMessages((p) =>
-                  p.map((m) => (m.id === fixMsgId ? { ...m, isStreaming: false } : m))
-                );
-              }
-            } catch (vErr) {
-              console.error('Verification error:', vErr);
-            }
-          }
-
-          // Final completion celebration summary
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: `summary-${Date.now()}`,
-              role: 'assistant',
-              content: `🎉 **Implementation Completed Successfully!**\n\nAll ${planResult.phases.length} phases executed. Files have been generated, verified, and loaded into Monaco Editor.\n\n📂 Project Workspace: \`${workspacePath}\``,
-              timestamp: Date.now(),
-            },
-          ]);
-
-          showSuccessToast('All Phases Executed Successfully!');
-        }
+        await executePhase(newPlanState, 0, options.thinkingEnabled);
       }
     } catch (err: any) {
       if (err.name !== 'AbortError') {
@@ -1268,6 +1294,9 @@ Please fix these syntax errors immediately. Provide corrected file content using
             }
           }}
           getOriginalContent={getOriginalContent}
+          activePlan={activePlan}
+          onProceedNextPhase={handleProceedNextPhase}
+          onSkipPhase={handleSkipPhase}
           width={rightSidebarWidth}
         />
       </div>

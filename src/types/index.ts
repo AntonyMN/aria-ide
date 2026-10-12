@@ -111,6 +111,14 @@ export interface ActivityLogItem {
   title?: string;
 }
 
+export interface ActivePlanExecution {
+  prompt: string;
+  phases: ExecutionPhase[];
+  currentPhaseIndex: number;
+  status: 'idle' | 'executing' | 'paused' | 'completed' | 'error';
+  autoProceed?: boolean;
+}
+
 export interface WorkspaceSession {
   version?: string;
   updatedAt?: string;
@@ -120,5 +128,6 @@ export interface WorkspaceSession {
   openTabs?: { path: string; name: string }[];
   messages?: ChatMessage[];
   planTasks?: PlanTask[];
+  activePlan?: ActivePlanExecution | null;
 }
 

@@ -1060,9 +1060,11 @@ Brief architectural overview and technology stack choice.
         model,
         messages: [{ role: 'user', content: architectPrompt }],
         stream: false,
+        keep_alive: '15m',
         options: {
           temperature: 0.2,
           num_predict: 2048,
+          num_ctx: 4096,
         },
       }),
     });
@@ -1295,22 +1297,32 @@ The Antigravity backend will automatically create the files on disk and execute 
       systemInstruction += `\nInclude deep reasoning steps inside <think>...</think> tags before writing your answer.`;
     }
 
-    const messages = [
-      { role: 'system', content: systemInstruction },
-      ...conversationHistory,
-      { role: 'user', content: prompt },
-    ];
+    // Smart context pruning: keeps last 4 messages and compresses massive code blocks
+    const prunedMessages = [{ role: 'system', content: systemInstruction }];
+    const recentHistory = (conversationHistory || []).slice(-4);
+    for (const msg of recentHistory) {
+      let content = msg.content || '';
+      if (content.length > 2000) {
+        content = content.replace(/```(?:file:[^\n]+|[\w]+)?\n([\s\S]{250,}?)```/g, () => {
+          return '```\n[Code block omitted: file already synced to disk]\n```';
+        });
+      }
+      prunedMessages.push({ role: msg.role, content });
+    }
+    prunedMessages.push({ role: 'user', content: prompt });
 
     sendEvent('status', { status: 'Connecting to local LLM...' });
 
     // Call Ollama streaming API with Tools (for supported models) & AbortSignal
     const ollamaRequestBody = {
       model,
-      messages,
+      messages: prunedMessages,
       stream: true,
+      keep_alive: '15m',
       options: {
         temperature: 0.2,
         num_predict: 4096,
+        num_ctx: 4096,
         stop: ['<|endoftext|>', '<|im_end|>', '\n\nUser:', '\n\nHuman:'],
       },
     };
@@ -1326,12 +1338,26 @@ The Antigravity backend will automatically create the files on disk and execute 
       ollamaRequestBody.tools = OLLAMA_TOOLS;
     }
 
-    const ollamaRes = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      signal: controller.signal,
-      body: JSON.stringify(ollamaRequestBody),
-    });
+    let ollamaRes;
+    try {
+      ollamaRes = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify(ollamaRequestBody),
+      });
+    } catch (fetchErr) {
+      if (controller.signal.aborted) {
+        sendEvent('status', { status: 'Stopped' });
+        res.end();
+        return;
+      }
+      sendEvent('error', {
+        error: `Local LLM connection dropped (${fetchErr.message}). Ollama may be running out of memory or busy. The phase has paused — you can click 'Proceed' to resume safely.`,
+      });
+      res.end();
+      return;
+    }
 
     if (!ollamaRes.ok) {
       const errText = await ollamaRes.text();

@@ -516,8 +516,11 @@ app.post('/api/agent/stream', async (req, res) => {
   const controller = new AbortController();
   activeGenerations.add(controller);
 
-  req.on('close', () => {
-    controller.abort();
+  // Only abort if client socket terminates before stream completion
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      controller.abort();
+    }
     activeGenerations.delete(controller);
   });
 

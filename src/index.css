@@ -920,4 +920,107 @@ body {
   background: transparent;
 }
 
+/* ========================================================
+   SweetAlert2 Dark Theme Customization
+   ======================================================== */
+.swal-ide-popup {
+  border: 1px solid rgba(255, 255, 255, 0.12) !important;
+  border-radius: 14px !important;
+  box-shadow: 0 16px 45px rgba(0, 0, 0, 0.85), 0 0 25px rgba(0, 240, 255, 0.15) !important;
+  padding: 24px 20px !important;
+  font-family: var(--font-sans) !important;
+  background: #0b0f19 !important;
+}
+
+.swal-ide-title {
+  color: #ffffff !important;
+  font-size: 18px !important;
+  font-weight: 700 !important;
+  letter-spacing: -0.02em !important;
+  margin-bottom: 8px !important;
+}
+
+.swal-ide-html {
+  color: var(--text-muted) !important;
+  font-size: 13.5px !important;
+  line-height: 1.55 !important;
+}
+
+.swal-ide-input {
+  background: #05080e !important;
+  border: 1px solid var(--border-color) !important;
+  color: #e2e8f0 !important;
+  border-radius: 8px !important;
+  padding: 10px 14px !important;
+  font-size: 13px !important;
+  font-family: var(--font-mono) !important;
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.4) !important;
+  margin: 16px auto 10px !important;
+  width: 90% !important;
+  box-sizing: border-box !important;
+}
+
+.swal-ide-input:focus {
+  border-color: var(--accent-cyan) !important;
+  box-shadow: 0 0 12px rgba(0, 240, 255, 0.3) !important;
+  outline: none !important;
+}
+
+.swal-ide-confirm {
+  background: linear-gradient(135deg, #00f0ff 0%, #3b82f6 100%) !important;
+  color: #000000 !important;
+  font-weight: 600 !important;
+  font-size: 13px !important;
+  padding: 8px 18px !important;
+  border-radius: 8px !important;
+  border: none !important;
+  cursor: pointer !important;
+  margin: 0 6px !important;
+  transition: all 0.2s ease !important;
+  box-shadow: 0 0 10px rgba(0, 240, 255, 0.25) !important;
+}
+
+.swal-ide-confirm:hover {
+  transform: translateY(-1px) !important;
+  box-shadow: 0 0 16px rgba(0, 240, 255, 0.5) !important;
+}
+
+.swal-ide-confirm-danger {
+  background: linear-gradient(135deg, #ef4444 0%, #b91c1c 100%) !important;
+  color: #ffffff !important;
+  font-weight: 600 !important;
+  font-size: 13px !important;
+  padding: 8px 18px !important;
+  border-radius: 8px !important;
+  border: none !important;
+  cursor: pointer !important;
+  margin: 0 6px !important;
+  box-shadow: 0 0 12px rgba(239, 68, 68, 0.3) !important;
+  transition: all 0.2s ease !important;
+}
+
+.swal-ide-confirm-danger:hover {
+  transform: translateY(-1px) !important;
+  box-shadow: 0 0 18px rgba(239, 68, 68, 0.6) !important;
+}
+
+.swal-ide-cancel {
+  background: rgba(255, 255, 255, 0.08) !important;
+  color: var(--text-main) !important;
+  font-weight: 500 !important;
+  font-size: 13px !important;
+  padding: 8px 18px !important;
+  border-radius: 8px !important;
+  border: 1px solid var(--border-color) !important;
+  cursor: pointer !important;
+  margin: 0 6px !important;
+  transition: all 0.2s ease !important;
+}
+
+.swal-ide-cancel:hover {
+  background: rgba(255, 255, 255, 0.14) !important;
+  border-color: rgba(255, 255, 255, 0.2) !important;
+}
+
+
 

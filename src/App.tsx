@@ -27,6 +27,14 @@ import { DiffReviewModal } from './components/DiffReviewModal';
 import { PlanDrawer } from './components/PlanDrawer';
 import { AgentChatPane } from './components/AgentChatPane';
 import {
+  confirmStopGeneration,
+  promptText,
+  confirmAction,
+  showErrorAlert,
+  showWarningAlert,
+  showSuccessToast,
+} from './services/alerts';
+import {
   Cpu,
   FolderOpen,
   Save,
@@ -254,8 +262,19 @@ export function App() {
   };
 
   // Close editor tab
-  const handleCloseTab = (tabId: string, e: React.MouseEvent) => {
+  const handleCloseTab = async (tabId: string, e: React.MouseEvent) => {
     e.stopPropagation();
+    const tabToClose = tabs.find((t) => t.id === tabId);
+    if (tabToClose?.isDirty) {
+      const discard = await confirmAction({
+        title: 'Unsaved Changes',
+        text: `"${tabToClose.name}" has unsaved changes. Do you want to close it without saving?`,
+        confirmButtonText: 'Discard & Close',
+        isDanger: true,
+      });
+      if (!discard) return;
+    }
+
     const remaining = tabs.filter((t) => t.id !== tabId);
     setTabs(remaining);
     if (activeTabId === tabId) {
@@ -300,8 +319,10 @@ export function App() {
         )
       );
       loadWorkspace();
-    } catch (err) {
+      showSuccessToast(`Saved "${activeTab.name}"`);
+    } catch (err: any) {
       console.error('Failed to save file:', err);
+      showErrorAlert('Save Failed', err.message || String(err));
     }
   };
 
@@ -317,10 +338,17 @@ export function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [activeTabId, tabs]);
 
-  // Create file or folder
+  // Create file or folder with SweetAlert2
   const handleCreateItem = async (parentPath: string, isDirectory: boolean) => {
-    const name = window.prompt(`Enter ${isDirectory ? 'folder' : 'file'} name:`);
+    const parentName = parentPath.split('/').pop() || parentPath;
+    const name = await promptText({
+      title: `Create ${isDirectory ? 'Folder' : 'File'}`,
+      text: `Enter name for new ${isDirectory ? 'directory' : 'file'} in "${parentName}":`,
+      placeholder: isDirectory ? 'e.g. components' : 'e.g. index.ts',
+      confirmButtonText: 'Create',
+    });
     if (!name) return;
+
     const targetPath = `${parentPath}/${name}`;
     try {
       await createItem(targetPath, isDirectory);
@@ -328,29 +356,46 @@ export function App() {
       if (!isDirectory) {
         handleSelectFile(targetPath);
       }
-    } catch (err) {
-      alert(`Failed to create item: ${err}`);
+      showSuccessToast(`${isDirectory ? 'Folder' : 'File'} "${name}" created`);
+    } catch (err: any) {
+      await showErrorAlert('Creation Failed', err.message || String(err));
     }
   };
 
-  // Delete file or folder
+  // Delete file or folder with SweetAlert2
   const handleDeleteItem = async (targetPath: string) => {
-    if (!window.confirm(`Are you sure you want to delete ${targetPath}?`)) return;
+    const itemName = targetPath.split('/').pop() || targetPath;
+    const confirmed = await confirmAction({
+      title: 'Delete Item?',
+      text: `Are you sure you want to permanently delete "${itemName}"? This action cannot be undone.`,
+      confirmButtonText: 'Delete Permanently',
+      isDanger: true,
+    });
+    if (!confirmed) return;
+
     try {
       await deleteItem(targetPath);
       setTabs((prev) => prev.filter((t) => t.path !== targetPath));
       loadWorkspace();
-    } catch (err) {
-      alert(`Failed to delete: ${err}`);
+      showSuccessToast(`"${itemName}" deleted`);
+    } catch (err: any) {
+      await showErrorAlert('Deletion Failed', err.message || String(err));
     }
   };
 
-  // Switch workspace path
-  const handleSwitchWorkspace = () => {
-    const newPath = window.prompt('Enter workspace directory path:', workspacePath);
+  // Switch workspace path with SweetAlert2
+  const handleSwitchWorkspace = async () => {
+    const newPath = await promptText({
+      title: 'Switch Workspace Directory',
+      text: 'Enter the absolute path to your project folder:',
+      inputValue: workspacePath,
+      placeholder: '/home/username/project',
+      confirmButtonText: 'Open Workspace',
+    });
     if (newPath && newPath !== workspacePath) {
       setWorkspacePath(newPath);
       loadWorkspace(newPath);
+      showSuccessToast('Workspace directory updated');
     }
   };
 
@@ -377,14 +422,23 @@ export function App() {
       );
       loadWorkspace();
       handleSelectFile(fullPath);
-    } catch (err) {
-      alert(`Failed to apply diff: ${err}`);
+      showSuccessToast('Changes applied successfully');
+    } catch (err: any) {
+      await showErrorAlert('Failed to Apply Diff', err.message || String(err));
     }
   };
 
   const abortControllerRef = useRef<AbortController | null>(null);
 
+  // Stop Generation with SweetAlert2 confirmation
   const handleStopGeneration = async () => {
+    if (!isStreaming) return;
+
+    const confirmed = await confirmStopGeneration();
+    if (!confirmed) {
+      return; // User canceled the stop prompt; continue generating!
+    }
+
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
@@ -402,9 +456,10 @@ export function App() {
           : m
       )
     );
+    showSuccessToast('AI generation stopped');
   };
 
-  // Keyboard shortcut: Escape key cancels active generation
+  // Keyboard shortcut: Escape key triggers stop generation prompt
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape' && isStreaming) {
@@ -421,7 +476,7 @@ export function App() {
     options: { thinkingEnabled: boolean; mode: 'chat' | 'plan' }
   ) => {
     if (!selectedModel) {
-      alert('Please select a local model first.');
+      await showWarningAlert('Model Required', 'Please select a local AI model from the top model selector first.');
       setIsModelModalOpen(true);
       return;
     }

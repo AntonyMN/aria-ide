@@ -21,8 +21,11 @@ import {
   RotateCw,
   Copy,
   Check,
+  Zap,
+  CheckCircle2,
+  AlertTriangle,
 } from 'lucide-react';
-import { runTerminalCommand, readFileContent } from '../services/api';
+import { runTerminalCommand, readFileContent, saveFileContent } from '../services/api';
 
 interface Props {
   messages: ChatMessage[];
@@ -143,12 +146,105 @@ export const AgentChatPane: React.FC<Props> = ({
   const [inputPrompt, setInputPrompt] = useState('');
   const [thinkingEnabled, setThinkingEnabled] = useState(true);
   const [mode, setMode] = useState<'chat' | 'plan'>('chat');
+  const [autoExecute, setAutoExecute] = useState(true);
   const [expandedThinking, setExpandedThinking] = useState<Record<string, boolean>>({});
+  const [executedMessageIds, setExecutedMessageIds] = useState<Set<string>>(new Set());
+  const [executionState, setExecutionState] = useState<{
+    [msgId: string]: { status: 'idle' | 'running' | 'done' | 'error'; log?: string };
+  }>({});
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isStreaming]);
+
+  // Helper to extract file modifications and bash commands from raw markdown text
+  const extractActions = (content: string) => {
+    const fileMatches = [
+      ...content.matchAll(/```(?:file:([^\n]+))\n([\s\S]*?)```/g),
+    ];
+    const bashMatches = [
+      ...content.matchAll(/```(?:bash:run)\n([\s\S]*?)```/g),
+    ];
+
+    return { fileMatches, bashMatches };
+  };
+
+  // Autonomous batch execution of all commands & file modifications
+  const handleExecuteAllActions = async (msgId: string, content: string) => {
+    const { fileMatches, bashMatches } = extractActions(content);
+    if (fileMatches.length === 0 && bashMatches.length === 0) return;
+
+    setExecutionState((prev) => ({
+      ...prev,
+      [msgId]: { status: 'running', log: 'Starting autonomous execution...' },
+    }));
+
+    try {
+      // 1. Write / update files
+      for (let i = 0; i < fileMatches.length; i++) {
+        const filePath = fileMatches[i][1].trim();
+        const fileContent = fileMatches[i][2];
+        const fullPath = filePath.startsWith('/') ? filePath : `${workspacePath}/${filePath}`;
+        setExecutionState((prev) => ({
+          ...prev,
+          [msgId]: { status: 'running', log: `Writing file [${i + 1}/${fileMatches.length}]: ${filePath}...` },
+        }));
+        await saveFileContent(fullPath, fileContent);
+      }
+
+      onFileSavedOrCreated();
+
+      // 2. Execute bash commands sequentially
+      for (let j = 0; j < bashMatches.length; j++) {
+        const cmd = bashMatches[j][1].trim();
+        setExecutionState((prev) => ({
+          ...prev,
+          [msgId]: { status: 'running', log: `Executing command [${j + 1}/${bashMatches.length}]: ${cmd}...` },
+        }));
+
+        const res = await runTerminalCommand(cmd, workspacePath);
+        if (res.hasError) {
+          setExecutionState((prev) => ({
+            ...prev,
+            [msgId]: { status: 'error', log: `Command failed: ${cmd}\n${res.stderr || res.stdout}` },
+          }));
+
+          // Trigger automatic error self-correction with LLM
+          onSendMessage(
+            `Autonomous command failed:\n\`\`\`bash\n${cmd}\n\`\`\`\nError output:\n\`\`\`\n${res.stderr || res.stdout}\n\`\`\`\nPlease analyze this error, adjust the implementation plan, and emit the fix.`,
+            { thinkingEnabled: true, mode: 'chat' }
+          );
+          return;
+        }
+      }
+
+      setExecutionState((prev) => ({
+        ...prev,
+        [msgId]: { status: 'done', log: 'All actions executed successfully!' },
+      }));
+      setExecutedMessageIds((prev) => new Set(prev).add(msgId));
+    } catch (err: any) {
+      setExecutionState((prev) => ({
+        ...prev,
+        [msgId]: { status: 'error', log: `Execution error: ${err.message}` },
+      }));
+    }
+  };
+
+  // Watch for completed streaming responses and auto-execute if enabled
+  useEffect(() => {
+    if (isStreaming || !autoExecute) return;
+
+    const lastMsg = messages[messages.length - 1];
+    if (lastMsg && lastMsg.role === 'assistant' && !executedMessageIds.has(lastMsg.id)) {
+      const { fileMatches, bashMatches } = extractActions(lastMsg.content);
+      if (fileMatches.length > 0 || bashMatches.length > 0) {
+        handleExecuteAllActions(lastMsg.id, lastMsg.content);
+      }
+    }
+  }, [isStreaming, messages, autoExecute]);
 
   const toggleThinking = (id: string) => {
     setExpandedThinking((prev) => ({ ...prev, [id]: !prev[id] }));
@@ -187,7 +283,6 @@ export const AgentChatPane: React.FC<Props> = ({
     try {
       const res = await runTerminalCommand(command, workspacePath);
       if (res.hasError) {
-        // Trigger self-correction flow!
         onSendMessage(
           `Command "${command}" failed with error:\n${res.stderr || res.stdout}\nPlease analyze the error and fix it.`,
           { thinkingEnabled: true, mode: 'chat' }
@@ -198,7 +293,6 @@ export const AgentChatPane: React.FC<Props> = ({
     } catch (e) {}
   };
 
-  // Clean raw message content by stripping unclosed or raw <think> tags for markdown display
   const sanitizeMarkdown = (content: string) => {
     return content.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
   };
@@ -208,7 +302,7 @@ export const AgentChatPane: React.FC<Props> = ({
       <div className="ai-header">
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <Sparkles size={16} color="var(--accent-cyan)" />
-          <span style={{ fontSize: 13, fontWeight: 700 }}>AI Coding Partner</span>
+          <span style={{ fontSize: 13, fontWeight: 700 }}>Autonomous AI Agent</span>
         </div>
         <div style={{ fontSize: 11, color: 'var(--text-dim)', fontFamily: 'var(--font-mono)' }}>
           {selectedModel || 'No model chosen'}
@@ -219,16 +313,19 @@ export const AgentChatPane: React.FC<Props> = ({
         {messages.length === 0 && (
           <div style={{ padding: 24, textAlign: 'center', color: 'var(--text-dim)', fontSize: 13 }}>
             <p style={{ fontWeight: 600, color: 'var(--text-main)', marginBottom: 6 }}>
-              Local AI Session Ready
+              Autonomous Developer Ready
             </p>
             <p style={{ fontSize: 12 }}>
-              Ask to inspect code, create implementation plans, propose edits, or run terminal commands. Responses will be rendered in formatted Markdown.
+              Give a prompt (e.g. <em>"Scaffold a Laravel Breeze Inertia Vue shop"</em>). The model will design a plan, generate files, and automatically run commands in your workspace.
             </p>
           </div>
         )}
 
         {messages.map((msg) => {
           const displayContent = sanitizeMarkdown(msg.content);
+          const { fileMatches, bashMatches } = extractActions(msg.content);
+          const hasActions = fileMatches.length > 0 || bashMatches.length > 0;
+          const currentExec = executionState[msg.id];
 
           return (
             <div
@@ -285,8 +382,52 @@ export const AgentChatPane: React.FC<Props> = ({
                       },
                     }}
                   >
-                    {displayContent || (msg.isStreaming ? 'Thinking...' : '')}
+                    {displayContent || (msg.isStreaming ? 'Analyzing task and generating plan...' : '')}
                   </ReactMarkdown>
+                </div>
+              )}
+
+              {/* Autonomous Action Execution Status Bar */}
+              {hasActions && msg.role === 'assistant' && !msg.isStreaming && (
+                <div style={{
+                  marginTop: 12,
+                  padding: '8px 12px',
+                  borderRadius: 8,
+                  background: 'rgba(0, 0, 0, 0.35)',
+                  border: '1px solid var(--border-color)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: 10,
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
+                    {currentExec?.status === 'running' ? (
+                      <RotateCw size={14} className="spin" color="var(--accent-cyan)" />
+                    ) : currentExec?.status === 'done' ? (
+                      <CheckCircle2 size={14} color="var(--accent-emerald)" />
+                    ) : currentExec?.status === 'error' ? (
+                      <AlertTriangle size={14} color="var(--accent-rose)" />
+                    ) : (
+                      <Zap size={14} color="var(--accent-amber)" />
+                    )}
+                    <span>
+                      {currentExec?.log || `${fileMatches.length} files, ${bashMatches.length} commands`}
+                    </span>
+                  </div>
+
+                  <button
+                    className="send-btn"
+                    style={{
+                      padding: '4px 10px',
+                      fontSize: 11,
+                      background: currentExec?.status === 'done' ? 'rgba(16, 185, 129, 0.2)' : undefined,
+                      color: currentExec?.status === 'done' ? 'var(--accent-emerald)' : undefined,
+                    }}
+                    onClick={() => handleExecuteAllActions(msg.id, msg.content)}
+                    disabled={currentExec?.status === 'running'}
+                  >
+                    {currentExec?.status === 'running' ? 'Executing...' : currentExec?.status === 'done' ? 'Re-Run Actions' : 'Run All Actions'}
+                  </button>
                 </div>
               )}
             </div>
@@ -299,6 +440,13 @@ export const AgentChatPane: React.FC<Props> = ({
       <div className="ai-input-bar">
         <div className="ai-controls">
           <div style={{ display: 'flex', gap: 8 }}>
+            <button
+              className={`toggle-chip ${autoExecute ? 'active' : ''}`}
+              onClick={() => setAutoExecute(!autoExecute)}
+              title="Automatically run emitted commands and create files"
+            >
+              <Zap size={13} /> Auto-Execute
+            </button>
             <button
               className={`toggle-chip ${thinkingEnabled ? 'active' : ''}`}
               onClick={() => setThinkingEnabled(!thinkingEnabled)}
@@ -324,11 +472,7 @@ export const AgentChatPane: React.FC<Props> = ({
         <div style={{ display: 'flex', gap: 8 }}>
           <textarea
             className="ai-textarea"
-            placeholder={
-              mode === 'plan'
-                ? 'Describe the feature to create an implementation plan...'
-                : 'Ask local LLM to write, edit code, or run terminal commands...'
-            }
+            placeholder="Tell the AI what to build or modify... (it will plan, generate files, and run commands)"
             value={inputPrompt}
             onChange={(e) => setInputPrompt(e.target.value)}
             onKeyDown={(e) => {

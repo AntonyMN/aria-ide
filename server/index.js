@@ -499,33 +499,58 @@ app.post('/api/agent/stream', async (req, res) => {
 
   try {
     // Provide repository context & tools schema in system prompt
-    const tree = buildFileTree(workspacePath || process.cwd(), 0, 2);
+    const targetWorkspace = workspacePath || process.cwd();
+    const tree = buildFileTree(targetWorkspace, 0, 2);
     const fileListSnippet = tree.map((t) => (t.isDirectory ? `📁 ${t.name}/` : `📄 ${t.name}`)).join('\n');
 
-    let systemInstruction = `You are Antigravity Local AI, an intelligent coding assistant running locally inside an IDE.
-Current workspace directory: ${workspacePath || process.cwd()}
-
-Folder structure overview:
-${fileListSnippet}
-
-You have the ability to inspect files, edit files, and execute terminal commands.
-When you want to edit a file, provide the change in this exact format:
-\`\`\`file:relative/path/to/file.ext
-[Full new content or modification]
-\`\`\`
-
-When you want to execute a terminal command (e.g. tests, linting, package install), use:
-\`\`\`bash:run
-command to execute
-\`\`\`
-`;
-
-    if (mode === 'plan') {
-      systemInstruction += `\nTASK: Generate a clear, structured implementation plan first. Use markdown checkable lists:
-- [ ] Phase 1: ...
-- [ ] Phase 2: ...
-Include file paths and potential commands before writing the actual code.`;
+    let manifestInfo = '';
+    const pkgPath = path.join(targetWorkspace, 'package.json');
+    if (fs.existsSync(pkgPath)) {
+      try {
+        const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+        manifestInfo += `\npackage.json dependencies: ${JSON.stringify({ ...pkg.dependencies, ...pkg.devDependencies })}`;
+      } catch (e) {}
     }
+    const composerPath = path.join(targetWorkspace, 'composer.json');
+    if (fs.existsSync(composerPath)) {
+      try {
+        const comp = JSON.parse(fs.readFileSync(composerPath, 'utf8'));
+        manifestInfo += `\ncomposer.json dependencies: ${JSON.stringify(comp.require)}`;
+      } catch (e) {}
+    }
+
+    let systemInstruction = `You are the Autonomous Software Engineer of the Antigravity IDE.
+You are running on Linux Ubuntu with direct access to terminal execution and filesystem manipulation.
+Current workspace directory: ${targetWorkspace}
+
+Workspace File Tree:
+${fileListSnippet || '(Empty workspace)'}
+${manifestInfo}
+
+STRICT OPERATIONAL DIRECTIVES:
+1. NEVER instruct the user what commands to run or how to build things. Do NOT say "You can install...", "First you need to...", or "Here are the steps you should follow...". The user will NOT run anything manually.
+2. YOU must directly execute the work using actionable blocks.
+3. Every response MUST follow this structured workflow:
+
+### Implementation Plan
+Always start by identifying the clear steps as a checklist to maintain focus and prevent hallucinations:
+- [ ] Step 1: [Specific setup or scaffolding step]
+- [ ] Step 2: [Specific file or component to create/modify]
+- [ ] Step 3: [Build or verification step]
+
+### Actions
+Immediately emit the executable commands and file contents for the IDE to run and write:
+- To run terminal commands (scaffolding, installing packages, running migrations, building):
+\`\`\`bash:run
+command to run
+\`\`\`
+
+- To create or update files in the workspace:
+\`\`\`file:relative/path/to/file.ext
+[complete file code here]
+\`\`\`
+
+4. Provide real, complete code without placeholders. The IDE backend automatically runs your bash commands and writes your files to the disk.`;
 
     if (thinkingEnabled) {
       systemInstruction += `\nInclude deep reasoning steps inside <think>...</think> tags before writing your answer.`;

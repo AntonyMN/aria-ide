@@ -18,6 +18,7 @@ import {
   createItem,
   deleteItem,
   detectLanguage,
+  stopAgentGeneration,
 } from './services/api';
 import { FileTree } from './components/FileTree';
 import { ModelSelectorModal } from './components/ModelSelectorModal';
@@ -268,6 +269,39 @@ export function App() {
     }
   };
 
+  const abortControllerRef = useRef<AbortController | null>(null);
+
+  const handleStopGeneration = async () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    await stopAgentGeneration();
+    setIsStreaming(false);
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.isStreaming
+          ? {
+              ...m,
+              isStreaming: false,
+              content: (m.content || '') + '\n\n*(Generation stopped by user)*',
+            }
+          : m
+      )
+    );
+  };
+
+  // Keyboard shortcut: Escape key cancels active generation
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && isStreaming) {
+        handleStopGeneration();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isStreaming]);
+
   // Agent Chat Streaming Handler
   const handleSendMessage = async (
     prompt: string,
@@ -299,10 +333,14 @@ export function App() {
     setMessages((prev) => [...prev, userMsg, assistantMsg]);
     setIsStreaming(true);
 
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     try {
       const response = await fetch('http://localhost:3001/api/agent/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
           model: selectedModel,
           prompt,
@@ -616,6 +654,7 @@ export function App() {
         <AgentChatPane
           messages={messages}
           onSendMessage={handleSendMessage}
+          onStopGeneration={handleStopGeneration}
           selectedModel={selectedModel}
           isStreaming={isStreaming}
           onOpenDiffReview={(diff) => setActiveDiff(diff)}

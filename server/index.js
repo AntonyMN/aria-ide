@@ -480,6 +480,20 @@ wss.on('connection', (ws) => {
 // ==========================================
 // 5. AGENTIC EXECUTION & STREAMING CHAT
 // ==========================================
+const activeGenerations = new Set();
+
+app.post('/api/agent/stop', (req, res) => {
+  let count = 0;
+  for (const c of activeGenerations) {
+    try {
+      c.abort();
+      count++;
+    } catch (e) {}
+  }
+  activeGenerations.clear();
+  res.json({ success: true, stopped: count });
+});
+
 app.post('/api/agent/stream', async (req, res) => {
   const { model, prompt, workspacePath, thinkingEnabled, mode, conversationHistory = [] } = req.body;
 
@@ -494,8 +508,18 @@ app.post('/api/agent/stream', async (req, res) => {
   res.flushHeaders();
 
   const sendEvent = (event, data) => {
-    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    try {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    } catch (e) {}
   };
+
+  const controller = new AbortController();
+  activeGenerations.add(controller);
+
+  req.on('close', () => {
+    controller.abort();
+    activeGenerations.delete(controller);
+  });
 
   try {
     // Provide repository context & tools schema in system prompt
@@ -564,16 +588,19 @@ command to run
 
     sendEvent('status', { status: 'Connecting to local LLM...' });
 
-    // Call Ollama streaming API
+    // Call Ollama streaming API with AbortSignal and max tokens
     const ollamaRes = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
       body: JSON.stringify({
         model,
         messages,
         stream: true,
         options: {
           temperature: 0.2,
+          num_predict: 3072,
+          stop: ['<|endoftext|>', '<|im_end|>', '\n\nUser:', '\n\nHuman:'],
         },
       }),
     });
@@ -592,6 +619,11 @@ command to run
     let inThinkTag = false;
 
     while (true) {
+      if (controller.signal.aborted) {
+        sendEvent('status', { status: 'Stopped' });
+        break;
+      }
+
       const { done, value } = await reader.read();
       if (done) break;
 
@@ -599,6 +631,7 @@ command to run
       const lines = chunk.split('\n').filter((l) => l.trim().length > 0);
 
       for (const line of lines) {
+        if (controller.signal.aborted) break;
         try {
           const parsed = JSON.parse(line);
           const delta = parsed.message?.content || '';
@@ -632,8 +665,14 @@ command to run
 
     res.end();
   } catch (err) {
-    sendEvent('error', { error: err.message });
+    if (err.name === 'AbortError') {
+      sendEvent('status', { status: 'Stopped' });
+    } else {
+      sendEvent('error', { error: err.message });
+    }
     res.end();
+  } finally {
+    activeGenerations.delete(controller);
   }
 });
 

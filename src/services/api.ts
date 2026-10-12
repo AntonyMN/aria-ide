@@ -118,3 +118,13 @@ export function detectLanguage(filePath: string): string {
       return 'plaintext';
   }
 }
+
+export async function stopAgentGeneration(): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE}/agent/stop`, { method: 'POST' });
+    return res.ok;
+  } catch (e) {
+    return false;
+  }
+}
+

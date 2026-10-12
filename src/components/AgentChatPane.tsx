@@ -24,6 +24,7 @@ import {
   Zap,
   CheckCircle2,
   AlertTriangle,
+  Square,
 } from 'lucide-react';
 import { runTerminalCommand, readFileContent, saveFileContent } from '../services/api';
 
@@ -33,6 +34,7 @@ interface Props {
     prompt: string,
     options: { thinkingEnabled: boolean; mode: 'chat' | 'plan' }
   ) => void;
+  onStopGeneration: () => void;
   selectedModel: string;
   isStreaming: boolean;
   onOpenDiffReview: (diff: DiffProposal) => void;
@@ -136,6 +138,7 @@ const CodeBlock: React.FC<{
 export const AgentChatPane: React.FC<Props> = ({
   messages,
   onSendMessage,
+  onStopGeneration,
   selectedModel,
   isStreaming,
   onOpenDiffReview,
@@ -154,6 +157,8 @@ export const AgentChatPane: React.FC<Props> = ({
   }>({});
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const isExecutingRef = useRef(false);
+  const autoRetryCountRef = useRef(0);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -173,12 +178,17 @@ export const AgentChatPane: React.FC<Props> = ({
 
   // Autonomous batch execution of all commands & file modifications
   const handleExecuteAllActions = async (msgId: string, content: string) => {
+    if (isExecutingRef.current) return;
     const { fileMatches, bashMatches } = extractActions(content);
     if (fileMatches.length === 0 && bashMatches.length === 0) return;
 
+    // Mark as executed immediately to prevent duplicate execution loops!
+    setExecutedMessageIds((prev) => new Set(prev).add(msgId));
+    isExecutingRef.current = true;
+
     setExecutionState((prev) => ({
       ...prev,
-      [msgId]: { status: 'running', log: 'Starting autonomous execution...' },
+      [msgId]: { status: 'running', log: 'Starting execution...' },
     }));
 
     try {
@@ -211,11 +221,15 @@ export const AgentChatPane: React.FC<Props> = ({
             [msgId]: { status: 'error', log: `Command failed: ${cmd}\n${res.stderr || res.stdout}` },
           }));
 
-          // Trigger automatic error self-correction with LLM
-          onSendMessage(
-            `Autonomous command failed:\n\`\`\`bash\n${cmd}\n\`\`\`\nError output:\n\`\`\`\n${res.stderr || res.stdout}\n\`\`\`\nPlease analyze this error, adjust the implementation plan, and emit the fix.`,
-            { thinkingEnabled: true, mode: 'chat' }
-          );
+          // Strict limit: only allow 1 automatic self-correction attempt to prevent infinite loops!
+          if (autoRetryCountRef.current < 1) {
+            autoRetryCountRef.current++;
+            onSendMessage(
+              `Command failed:\n\`\`\`bash\n${cmd}\n\`\`\`\nError output:\n\`\`\`\n${res.stderr || res.stdout}\n\`\`\`\nPlease analyze this error, adjust the plan, and provide the fix.`,
+              { thinkingEnabled: true, mode: 'chat' }
+            );
+          }
+          isExecutingRef.current = false;
           return;
         }
       }
@@ -224,18 +238,19 @@ export const AgentChatPane: React.FC<Props> = ({
         ...prev,
         [msgId]: { status: 'done', log: 'All actions executed successfully!' },
       }));
-      setExecutedMessageIds((prev) => new Set(prev).add(msgId));
     } catch (err: any) {
       setExecutionState((prev) => ({
         ...prev,
         [msgId]: { status: 'error', log: `Execution error: ${err.message}` },
       }));
+    } finally {
+      isExecutingRef.current = false;
     }
   };
 
   // Watch for completed streaming responses and auto-execute if enabled
   useEffect(() => {
-    if (isStreaming || !autoExecute) return;
+    if (isStreaming || !autoExecute || isExecutingRef.current) return;
 
     const lastMsg = messages[messages.length - 1];
     if (lastMsg && lastMsg.role === 'assistant' && !executedMessageIds.has(lastMsg.id)) {
@@ -304,8 +319,31 @@ export const AgentChatPane: React.FC<Props> = ({
           <Sparkles size={16} color="var(--accent-cyan)" />
           <span style={{ fontSize: 13, fontWeight: 700 }}>Autonomous AI Agent</span>
         </div>
-        <div style={{ fontSize: 11, color: 'var(--text-dim)', fontFamily: 'var(--font-mono)' }}>
-          {selectedModel || 'No model chosen'}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          {isStreaming && (
+            <button
+              className="icon-btn"
+              style={{
+                color: '#ef4444',
+                fontSize: 11,
+                fontWeight: 600,
+                padding: '2px 8px',
+                background: 'rgba(239, 68, 68, 0.15)',
+                border: '1px solid rgba(239, 68, 68, 0.3)',
+                borderRadius: 4,
+                display: 'flex',
+                alignItems: 'center',
+                gap: 4,
+              }}
+              onClick={onStopGeneration}
+              title="Stop generation immediately (Esc)"
+            >
+              <Square size={11} fill="currentColor" /> Stop
+            </button>
+          )}
+          <span style={{ fontSize: 11, color: 'var(--text-dim)', fontFamily: 'var(--font-mono)' }}>
+            {selectedModel || 'No model chosen'}
+          </span>
         </div>
       </div>
 
@@ -410,24 +448,40 @@ export const AgentChatPane: React.FC<Props> = ({
                     ) : (
                       <Zap size={14} color="var(--accent-amber)" />
                     )}
-                    <span>
+                    <span style={{ color: currentExec?.status === 'error' ? 'var(--accent-rose)' : undefined }}>
                       {currentExec?.log || `${fileMatches.length} files, ${bashMatches.length} commands`}
                     </span>
                   </div>
 
-                  <button
-                    className="send-btn"
-                    style={{
-                      padding: '4px 10px',
-                      fontSize: 11,
-                      background: currentExec?.status === 'done' ? 'rgba(16, 185, 129, 0.2)' : undefined,
-                      color: currentExec?.status === 'done' ? 'var(--accent-emerald)' : undefined,
-                    }}
-                    onClick={() => handleExecuteAllActions(msg.id, msg.content)}
-                    disabled={currentExec?.status === 'running'}
-                  >
-                    {currentExec?.status === 'running' ? 'Executing...' : currentExec?.status === 'done' ? 'Re-Run Actions' : 'Run All Actions'}
-                  </button>
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    {currentExec?.status === 'error' && (
+                      <button
+                        className="send-btn"
+                        style={{ padding: '4px 8px', fontSize: 11, background: 'rgba(239, 68, 68, 0.25)', color: '#ef4444' }}
+                        onClick={() => {
+                          onSendMessage(
+                            `Fix error for command failure:\n${currentExec.log}`,
+                            { thinkingEnabled: true, mode: 'chat' }
+                          );
+                        }}
+                      >
+                        Fix Error with AI
+                      </button>
+                    )}
+                    <button
+                      className="send-btn"
+                      style={{
+                        padding: '4px 10px',
+                        fontSize: 11,
+                        background: currentExec?.status === 'done' ? 'rgba(16, 185, 129, 0.2)' : undefined,
+                        color: currentExec?.status === 'done' ? 'var(--accent-emerald)' : undefined,
+                      }}
+                      onClick={() => handleExecuteAllActions(msg.id, msg.content)}
+                      disabled={currentExec?.status === 'running'}
+                    >
+                      {currentExec?.status === 'running' ? 'Executing...' : currentExec?.status === 'done' ? 'Re-Run Actions' : 'Run All Actions'}
+                    </button>
+                  </div>
                 </div>
               )}
             </div>
@@ -463,9 +517,30 @@ export const AgentChatPane: React.FC<Props> = ({
             </button>
           </div>
           {isStreaming && (
-            <span style={{ fontSize: 11, color: 'var(--accent-cyan)', display: 'flex', alignItems: 'center', gap: 4 }}>
-              <RotateCw size={11} className="spin" /> Generating...
-            </span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <span style={{ fontSize: 11, color: 'var(--accent-cyan)', display: 'flex', alignItems: 'center', gap: 4 }}>
+                <RotateCw size={11} className="spin" /> Generating...
+              </span>
+              <button
+                className="icon-btn"
+                style={{
+                  color: '#ef4444',
+                  fontSize: 10,
+                  fontWeight: 600,
+                  padding: '2px 6px',
+                  background: 'rgba(239, 68, 68, 0.15)',
+                  border: '1px solid rgba(239, 68, 68, 0.3)',
+                  borderRadius: 4,
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 3,
+                }}
+                onClick={onStopGeneration}
+                title="Stop generation (Esc)"
+              >
+                <Square size={9} fill="currentColor" /> Stop
+              </button>
+            </div>
           )}
         </div>
 
@@ -482,14 +557,37 @@ export const AgentChatPane: React.FC<Props> = ({
               }
             }}
           />
-          <button
-            className="send-btn"
-            style={{ height: 'auto', alignSelf: 'stretch' }}
-            onClick={() => handleSubmit()}
-            disabled={isStreaming || !inputPrompt.trim()}
-          >
-            <Send size={15} />
-          </button>
+          {isStreaming ? (
+            <button
+              className="send-btn"
+              style={{
+                height: 'auto',
+                alignSelf: 'stretch',
+                background: 'rgba(239, 68, 68, 0.25)',
+                border: '1px solid #ef4444',
+                color: '#ef4444',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+                padding: '0 14px',
+              }}
+              onClick={onStopGeneration}
+              title="Stop generation immediately (Esc)"
+            >
+              <Square size={13} fill="currentColor" />
+              <span>Stop</span>
+            </button>
+          ) : (
+            <button
+              className="send-btn"
+              style={{ height: 'auto', alignSelf: 'stretch' }}
+              onClick={() => handleSubmit()}
+              disabled={!inputPrompt.trim()}
+              title="Send prompt"
+            >
+              <Send size={15} />
+            </button>
+          )}
         </div>
       </div>
     </div>

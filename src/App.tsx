@@ -73,6 +73,15 @@ export function App() {
   const [systemMemory, setSystemMemory] = useState<SystemMemory | null>(null);
   const [isModelModalOpen, setIsModelModalOpen] = useState(false);
 
+  // Dual-Engine Fast Pilot State
+  const [isFastPilotEnabled, setIsFastPilotEnabled] = useState<boolean>(() => {
+    const saved = localStorage.getItem('aria_fast_pilot_enabled');
+    return saved !== null ? saved === 'true' : true;
+  });
+  const [fastPilotModel, setFastPilotModel] = useState<string>(() => {
+    return localStorage.getItem('aria_fast_pilot_model') || '';
+  });
+
   // LLM Booting / Wake-Up State
   const [isModelBooting, setIsModelBooting] = useState(false);
   const [bootProgress, setBootProgress] = useState(0);
@@ -283,8 +292,36 @@ export function App() {
         const safe = data.models.find((m) => m.safetyBadge === 'SAFE') || data.models[0];
         setSelectedModel(loaded ? loaded.name : safe.name);
       }
+
+      // Auto-select fast pilot model if none selected yet or invalid
+      const currentValid = fastPilotModel && data.models.some((m) => m.name === fastPilotModel);
+      if (!currentValid && data.models.length > 0) {
+        const bestLightweight = data.models
+          .filter((m) => parseFloat(m.sizeGB) <= 1.8)
+          .sort((a, b) => parseFloat(a.sizeGB) - parseFloat(b.sizeGB))[0];
+        if (bestLightweight) {
+          setFastPilotModel(bestLightweight.name);
+          localStorage.setItem('aria_fast_pilot_model', bestLightweight.name);
+        }
+      }
     } catch (err) {
       console.error('Failed to discover models:', err);
+    }
+  };
+
+  const handleSelectFastPilotModel = (modelName: string) => {
+    setFastPilotModel(modelName);
+    localStorage.setItem('aria_fast_pilot_model', modelName);
+    showSuccessToast(`Fast Pilot model set to ${modelName}`);
+  };
+
+  const handleToggleFastPilot = (enabled: boolean) => {
+    setIsFastPilotEnabled(enabled);
+    localStorage.setItem('aria_fast_pilot_enabled', String(enabled));
+    if (enabled) {
+      showSuccessToast('Dual-Engine Mode enabled: Fast Pilot handles intent & step routing.');
+    } else {
+      showInfoToast('Dual-Engine Mode disabled: Primary model handles all stages.');
     }
   };
 
@@ -1013,6 +1050,7 @@ export function App() {
         })(),
         openTabs: tabs.map((t) => ({ path: t.path, name: t.name })),
         conversationHistory: getCleanConversationHistory(),
+        fastPilotModel: isFastPilotEnabled && fastPilotModel ? fastPilotModel : undefined,
       }),
     });
 
@@ -1273,6 +1311,7 @@ export function App() {
         const currentGuidance = [...pendingUserGuidanceRef.current];
         pendingUserGuidanceRef.current = [];
 
+        const pilotModelToUse = isFastPilotEnabled && fastPilotModel ? fastPilotModel : selectedModel;
         const stepMsgId = `step-${stepIndex}-${Date.now()}`;
         const guidanceSnippetText =
           currentGuidance.length > 0
@@ -1284,7 +1323,7 @@ export function App() {
           {
             id: stepMsgId,
             role: 'assistant',
-            content: `🔍 **Step ${stepIndex}: Scanning workspace files & determining next action...**${guidanceSnippetText}`,
+            content: `🔍 **Step ${stepIndex}: Analyzing workspace files with ${pilotModelToUse}...**${guidanceSnippetText}`,
             thinking: '',
             isStreaming: true,
             timestamp: Date.now(),
@@ -1296,7 +1335,8 @@ export function App() {
 
         const stepResult = await executeAgentStep(
           {
-            model: selectedModel,
+            model: pilotModelToUse,
+            primaryModel: selectedModel,
             planPrompt,
             planMarkdown,
             stepIndex,
@@ -1811,20 +1851,22 @@ Output ONLY the file code inside:
       // =========================================================================
       // STEP 1: LAYER OF INTERPRETATION (Determine what the user intends before implementation)
       // =========================================================================
+      const pilotModelToUse = isFastPilotEnabled && fastPilotModel ? fastPilotModel : selectedModel;
       const interpretMsgId = `interpret-${Date.now()}`;
       setMessages((prev) => [
         ...prev,
         {
           id: interpretMsgId,
           role: 'assistant',
-          content: '🧠 **Analyzing project context & interpreting intent...**',
+          content: `🧠 **Analyzing project context & interpreting intent with ${pilotModelToUse}...**`,
           isStreaming: true,
           timestamp: Date.now(),
         },
       ]);
 
       const interpretationResult = await interpretUserIntent({
-        model: selectedModel,
+        model: pilotModelToUse,
+        primaryModel: selectedModel,
         prompt,
         workspacePath,
         currentCwd,
@@ -1897,6 +1939,7 @@ Output ONLY the file code inside:
 
         const planResult = await generateImplementationPlan({
           model: selectedModel,
+          fastPilotModel: isFastPilotEnabled && fastPilotModel ? fastPilotModel : undefined,
           prompt,
           workspacePath,
           interpretation,
@@ -2007,6 +2050,26 @@ Output ONLY the file code inside:
               </span>
             )}
           </button>
+
+          {/* Dual-Engine Fast Pilot Pill */}
+          {isFastPilotEnabled && fastPilotModel && (
+            <button
+              className="model-pill-btn active"
+              style={{
+                borderColor: 'rgba(234, 179, 8, 0.4)',
+                background: 'rgba(234, 179, 8, 0.08)',
+                color: '#facc15',
+              }}
+              onClick={() => setIsModelModalOpen(true)}
+              title={`Fast Pilot active: ${fastPilotModel} handles intent & step routing`}
+            >
+              <Zap size={13} color="#facc15" />
+              <span>Pilot: {fastPilotModel}</span>
+              <span className="badge" style={{ background: 'rgba(234, 179, 8, 0.2)', color: '#facc15', border: '1px solid rgba(234, 179, 8, 0.3)' }}>
+                ⚡ Fast
+              </span>
+            </button>
+          )}
 
           {/* Live LLM Booting Status Pill */}
           {isModelBooting && (
@@ -2499,6 +2562,10 @@ Output ONLY the file code inside:
         models={models}
         selectedModel={selectedModel}
         onSelectModel={handleSwitchModel}
+        fastPilotModel={fastPilotModel}
+        isFastPilotEnabled={isFastPilotEnabled}
+        onSelectFastPilotModel={handleSelectFastPilotModel}
+        onToggleFastPilot={handleToggleFastPilot}
         systemMemory={systemMemory}
         onRefresh={loadModelsAndHardware}
       />

@@ -18,6 +18,10 @@ interface Props {
   models: LocalModel[];
   selectedModel: string;
   onSelectModel: (modelName: string) => void;
+  fastPilotModel?: string;
+  isFastPilotEnabled?: boolean;
+  onSelectFastPilotModel?: (modelName: string) => void;
+  onToggleFastPilot?: (enabled: boolean) => void;
   systemMemory: SystemMemory | null;
   onRefresh: () => void;
 }
@@ -28,10 +32,14 @@ export const ModelSelectorModal: React.FC<Props> = ({
   models,
   selectedModel,
   onSelectModel,
+  fastPilotModel = '',
+  isFastPilotEnabled = false,
+  onSelectFastPilotModel,
+  onToggleFastPilot,
   systemMemory,
   onRefresh,
 }) => {
-  const [filterTab, setFilterTab] = useState<'all' | 'active'>('all');
+  const [filterTab, setFilterTab] = useState<'all' | 'active' | 'fast'>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [offloadingModel, setOffloadingModel] = useState<string | null>(null);
   const [isOffloadingAll, setIsOffloadingAll] = useState(false);
@@ -44,6 +52,10 @@ export const ModelSelectorModal: React.FC<Props> = ({
   if (!isOpen) return null;
 
   const activeModelsInRam = models.filter((m) => m.isLoadedInRam);
+  const lightweightModels = models
+    .filter((m) => parseFloat(m.sizeGB) <= 1.8)
+    .sort((a, b) => parseFloat(a.sizeGB) - parseFloat(b.sizeGB));
+
   const totalLoadedRamGB = activeModelsInRam
     .reduce((acc, m) => {
       const gb = m.loadedDetails?.ramGB ? parseFloat(m.loadedDetails.ramGB) : parseFloat(m.sizeGB);
@@ -53,6 +65,7 @@ export const ModelSelectorModal: React.FC<Props> = ({
 
   const filteredModels = models.filter((model) => {
     if (filterTab === 'active' && !model.isLoadedInRam) return false;
+    if (filterTab === 'fast' && parseFloat(model.sizeGB) > 1.8) return false;
     if (searchQuery.trim()) {
       const q = searchQuery.toLowerCase();
       return (
@@ -63,6 +76,11 @@ export const ModelSelectorModal: React.FC<Props> = ({
     }
     return true;
   });
+
+  const handleCopyPullCommand = (cmd: string) => {
+    navigator.clipboard.writeText(cmd);
+    showSuccessToast(`Copied to clipboard: "${cmd}"`);
+  };
 
   // Handle single model offload
   const handleOffloadSingle = async (e: React.MouseEvent, modelName: string) => {
@@ -308,6 +326,130 @@ export const ModelSelectorModal: React.FC<Props> = ({
           </div>
         )}
 
+        {/* Dual-Engine Fast Pilot Architecture Banner & Controls */}
+        <div
+          style={{
+            padding: '12px 20px',
+            background: isFastPilotEnabled ? 'rgba(234, 179, 8, 0.07)' : 'rgba(255, 255, 255, 0.02)',
+            borderBottom: '1px solid var(--border-color)',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 10,
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <div
+                style={{
+                  width: 28,
+                  height: 28,
+                  borderRadius: 6,
+                  background: 'rgba(234, 179, 8, 0.15)',
+                  border: '1px solid rgba(234, 179, 8, 0.3)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                }}
+              >
+                <Zap size={16} color="#facc15" />
+              </div>
+              <div>
+                <div style={{ fontSize: 13, fontWeight: 700, color: '#facc15' }}>
+                  Dual-Engine Architecture (Fast Pilot + Heavy Architect)
+                </div>
+                <div style={{ fontSize: 11, color: 'var(--text-dim)' }}>
+                  Offloads intent interpretation & quick step routing to an ultra-fast sub-1GB model, while the primary model handles deep planning & code synthesis.
+                </div>
+              </div>
+            </div>
+
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 12, fontWeight: 600, color: '#fff' }}>
+              <input
+                type="checkbox"
+                checked={!!isFastPilotEnabled}
+                onChange={(e) => onToggleFastPilot?.(e.target.checked)}
+                style={{ cursor: 'pointer', accentColor: '#facc15', width: 15, height: 15 }}
+              />
+              Enable Fast Pilot
+            </label>
+          </div>
+
+          {isFastPilotEnabled && (
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 12,
+                flexWrap: 'wrap',
+                background: 'rgba(0, 0, 0, 0.3)',
+                padding: '8px 12px',
+                borderRadius: 8,
+                border: '1px solid rgba(234, 179, 8, 0.2)',
+              }}
+            >
+              <span style={{ fontSize: 12, color: 'var(--text-dim)', fontWeight: 500 }}>Active Fast Pilot:</span>
+              {lightweightModels.length > 0 ? (
+                <select
+                  value={fastPilotModel}
+                  onChange={(e) => onSelectFastPilotModel?.(e.target.value)}
+                  style={{
+                    background: '#18181b',
+                    color: '#facc15',
+                    border: '1px solid rgba(234, 179, 8, 0.4)',
+                    borderRadius: 6,
+                    padding: '4px 10px',
+                    fontSize: 12,
+                    fontWeight: 600,
+                    outline: 'none',
+                    cursor: 'pointer',
+                  }}
+                >
+                  {lightweightModels.map((m) => (
+                    <option key={m.name} value={m.name} style={{ background: '#18181b', color: '#fff' }}>
+                      ⚡ {m.name} ({m.sizeGB} GB{parseFloat(m.sizeGB) <= 1.0 ? ' - <1GB' : ''})
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <span style={{ fontSize: 12, color: '#ef4444' }}>
+                  No models &lt; 1.8GB installed yet. Click a quick pull below!
+                </span>
+              )}
+
+              {/* Quick Pull Suggestions */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginLeft: 'auto', flexWrap: 'wrap' }}>
+                <span style={{ fontSize: 11, color: 'var(--text-dim)' }}>Recommended &lt;1GB:</span>
+                {[
+                  { name: 'qwen2.5-coder:0.5b', size: '390MB' },
+                  { name: 'deepseek-coder:1.3b', size: '776MB' },
+                  { name: 'smollm2:360m', size: '230MB' },
+                ].map((rec) => {
+                  const isInstalled = models.some((m) => m.name === rec.name);
+                  return (
+                    <button
+                      key={rec.name}
+                      onClick={() => handleCopyPullCommand(`ollama pull ${rec.name}`)}
+                      style={{
+                        fontSize: 10,
+                        background: isInstalled ? 'rgba(16, 185, 129, 0.15)' : 'rgba(255, 255, 255, 0.08)',
+                        border: '1px solid',
+                        borderColor: isInstalled ? 'rgba(16, 185, 129, 0.4)' : 'rgba(255, 255, 255, 0.15)',
+                        color: isInstalled ? '#10b981' : '#ddd',
+                        padding: '2px 8px',
+                        borderRadius: 4,
+                        cursor: 'pointer',
+                      }}
+                      title={isInstalled ? `Installed (${rec.size})` : `Click to copy 'ollama pull ${rec.name}' (${rec.size})`}
+                    >
+                      {isInstalled ? `✓ ${rec.name}` : `+ ${rec.name} (${rec.size})`}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+
         {/* Search & Tabs Toolbar */}
         <div
           style={{
@@ -357,6 +499,26 @@ export const ModelSelectorModal: React.FC<Props> = ({
             >
               {activeModelsInRam.length > 0 && <span className="pulsing-green-dot" />}
               <span>Loaded in RAM ({activeModelsInRam.length})</span>
+            </button>
+            <button
+              onClick={() => setFilterTab('fast')}
+              style={{
+                background: filterTab === 'fast' ? 'rgba(234, 179, 8, 0.15)' : 'transparent',
+                color: filterTab === 'fast' ? '#facc15' : 'var(--text-dim)',
+                border: '1px solid',
+                borderColor: filterTab === 'fast' ? 'rgba(234, 179, 8, 0.4)' : 'transparent',
+                borderRadius: 6,
+                padding: '4px 12px',
+                fontSize: 12,
+                cursor: 'pointer',
+                fontWeight: 600,
+                display: 'flex',
+                alignItems: 'center',
+                gap: 5,
+              }}
+            >
+              <Zap size={12} color="#facc15" />
+              <span>Fast Pilots ({lightweightModels.length})</span>
             </button>
           </div>
 
@@ -477,6 +639,44 @@ export const ModelSelectorModal: React.FC<Props> = ({
                         {model.safetyBadge === 'TIGHT' && '🟡 Tight RAM'}
                         {model.safetyBadge === 'SWAP_HEAVY' && '🔴 High Swap Risk'}
                       </span>
+
+                      {/* Fast Pilot Badge */}
+                      {model.name === fastPilotModel && isFastPilotEnabled && (
+                        <span
+                          style={{
+                            fontSize: 10,
+                            background: 'rgba(234, 179, 8, 0.2)',
+                            color: '#facc15',
+                            border: '1px solid rgba(234, 179, 8, 0.4)',
+                            padding: '2px 6px',
+                            borderRadius: 4,
+                            fontWeight: 700,
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 4,
+                          }}
+                        >
+                          <Zap size={10} color="#facc15" />
+                          <span>FAST PILOT</span>
+                        </span>
+                      )}
+
+                      {/* <1GB Lightweight Badge */}
+                      {parseFloat(model.sizeGB) <= 1.0 && (
+                        <span
+                          style={{
+                            fontSize: 10,
+                            background: 'rgba(16, 185, 129, 0.12)',
+                            color: '#10b981',
+                            border: '1px solid rgba(16, 185, 129, 0.3)',
+                            padding: '2px 6px',
+                            borderRadius: 4,
+                            fontWeight: 600,
+                          }}
+                        >
+                          ⚡ &lt;1GB LIGHTWEIGHT
+                        </span>
+                      )}
                     </div>
 
                     {/* Metadata specs */}
@@ -567,6 +767,35 @@ export const ModelSelectorModal: React.FC<Props> = ({
                             ? `Booting (${bootPercent}%)...`
                             : '⚡ Boot into RAM'}
                         </span>
+                      </button>
+                    )}
+
+                    {/* Set as Fast Pilot Button */}
+                    {parseFloat(model.sizeGB) <= 1.8 && (
+                      <button
+                        style={{
+                          background: model.name === fastPilotModel && isFastPilotEnabled ? 'rgba(234, 179, 8, 0.25)' : 'rgba(255, 255, 255, 0.08)',
+                          border: '1px solid',
+                          borderColor: model.name === fastPilotModel && isFastPilotEnabled ? '#facc15' : 'rgba(255, 255, 255, 0.15)',
+                          color: model.name === fastPilotModel && isFastPilotEnabled ? '#facc15' : 'var(--text-dim)',
+                          fontSize: 11,
+                          padding: '5px 10px',
+                          borderRadius: 6,
+                          cursor: 'pointer',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 5,
+                          fontWeight: 600,
+                        }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onSelectFastPilotModel?.(model.name);
+                          if (!isFastPilotEnabled) onToggleFastPilot?.(true);
+                        }}
+                        title="Set this model as the Fast Pilot router"
+                      >
+                        <Zap size={12} color={model.name === fastPilotModel && isFastPilotEnabled ? '#facc15' : undefined} />
+                        <span>{model.name === fastPilotModel && isFastPilotEnabled ? 'Active Pilot' : 'Use as Pilot'}</span>
                       </button>
                     )}
 

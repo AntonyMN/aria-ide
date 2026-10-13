@@ -337,6 +337,7 @@ export async function stopAgentGeneration(): Promise<boolean> {
 
 export async function interpretUserIntent(params: {
   model: string;
+  primaryModel?: string;
   prompt: string;
   workspacePath: string;
   currentCwd?: string;
@@ -360,6 +361,7 @@ export async function interpretUserIntent(params: {
 
 export async function generateImplementationPlan(params: {
   model: string;
+  fastPilotModel?: string;
   prompt: string;
   workspacePath: string;
   interpretation?: UserIntentInterpretation;
@@ -652,6 +654,7 @@ export interface AgentStepCallbacks {
 export async function executeAgentStep(
   params: {
     model: string;
+    primaryModel?: string;
     planPrompt: string;
     planMarkdown: string;
     stepIndex: number;

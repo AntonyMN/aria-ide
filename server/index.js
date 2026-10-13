@@ -219,13 +219,14 @@ async function offloadAllModelsAndWait(maxWaitMs = 12000, pollIntervalMs = 200) 
   };
 }
 
-// Helper: Ensure only targetModel is in RAM (evict all conflicting models and verify before generation)
-async function ensureOnlyTargetModelLoaded(targetModel, maxWaitMs = 10000) {
+// Helper: Ensure targetModel (and any allowed co-resident models) is in RAM (evict all conflicting models and verify before generation)
+async function ensureOnlyTargetModelLoaded(targetModel, allowedResidentModels = [], maxWaitMs = 10000) {
   if (!targetModel) return;
   try {
+    const allowed = [targetModel, ...(Array.isArray(allowedResidentModels) ? allowedResidentModels : [])].filter(Boolean);
     const active = await getOllamaActiveModels();
     const conflicting = active.filter(
-      (m) => !matchModelName(m.name, targetModel) && !matchModelName(m.model, targetModel)
+      (m) => !allowed.some((a) => matchModelName(m.name, a) || matchModelName(m.model, a))
     );
     if (conflicting.length === 0) return;
 
@@ -2412,7 +2413,7 @@ Summary of how the architecture and plan adapt to: "${interruptionMessage}".
 // Endpoint: User Intent Interpretation Layer
 // Analyzes user prompt, workspace context, and conversation history before any implementation begins.
 app.post('/api/agent/interpret', async (req, res) => {
-  const { model, prompt, workspacePath, currentCwd, recentHistory = [], conversationHistory } = req.body;
+  const { model, primaryModel, prompt, workspacePath, currentCwd, recentHistory = [], conversationHistory } = req.body;
   if (!model || !prompt) {
     return res.status(400).json({ error: 'model and prompt are required' });
   }
@@ -2514,7 +2515,7 @@ Respond with ONLY valid JSON inside a \`\`\`json code block, with NO other comme
 \`\`\``;
 
   try {
-    await ensureOnlyTargetModelLoaded(model);
+    await ensureOnlyTargetModelLoaded(model, primaryModel ? [primaryModel] : []);
 
     const ollamaRes = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
       method: 'POST',
@@ -2600,7 +2601,7 @@ Respond with ONLY valid JSON inside a \`\`\`json code block, with NO other comme
 
 // Endpoint: Generate Implementation Plan and write IMPLEMENTATION_PLAN.md to disk
 app.post('/api/agent/plan', async (req, res) => {
-  const { model, prompt, workspacePath, interpretation, conversationHistory = [], recentHistory = [] } = req.body;
+  const { model, fastPilotModel, prompt, workspacePath, interpretation, conversationHistory = [], recentHistory = [] } = req.body;
   if (!model || !prompt) {
     return res.status(400).json({ error: 'model and prompt are required' });
   }
@@ -2684,7 +2685,7 @@ Brief architectural overview and technology stack choice.
 (Repeat for any remaining phases)`;
 
   try {
-    await ensureOnlyTargetModelLoaded(model);
+    await ensureOnlyTargetModelLoaded(model, fastPilotModel ? [fastPilotModel] : []);
 
     const ollamaRes = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
       method: 'POST',
@@ -2807,6 +2808,7 @@ app.post('/api/agent/verify', async (req, res) => {
 app.post('/api/agent/step', async (req, res) => {
   const {
     model,
+    primaryModel,
     planPrompt,
     planMarkdown,
     stepIndex = 1,
@@ -2956,7 +2958,7 @@ Explain your reasoning in 1-2 concise sentences, then output the single action b
 
     sendEvent('status', { status: `LLM analyzing environment for Step ${stepIndex}...` });
 
-    await ensureOnlyTargetModelLoaded(model);
+    await ensureOnlyTargetModelLoaded(model, primaryModel ? [primaryModel] : []);
 
     const ollamaMessages = [
       { role: 'system', content: 'You are Aria IDE Autonomous Software Engineer. Issue one action at a time and drive the plan step by step.' },
@@ -3194,6 +3196,7 @@ Explain your reasoning in 1-2 concise sentences, then output the single action b
 app.post('/api/agent/stream', async (req, res) => {
     const {
       model,
+      fastPilotModel,
       prompt,
       workspacePath,
       currentCwd,
@@ -3444,7 +3447,7 @@ The Aria backend will automatically create the files on disk and execute the com
 
     let ollamaRes;
     try {
-      await ensureOnlyTargetModelLoaded(model);
+      await ensureOnlyTargetModelLoaded(model, fastPilotModel ? [fastPilotModel] : []);
 
       ollamaRes = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
         method: 'POST',

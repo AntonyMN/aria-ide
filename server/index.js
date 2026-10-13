@@ -2409,9 +2409,163 @@ Summary of how the architecture and plan adapt to: "${interruptionMessage}".
   }
 });
 
+// Endpoint: User Intent Interpretation Layer
+// Analyzes user prompt, workspace context, and conversation history before any implementation begins.
+app.post('/api/agent/interpret', async (req, res) => {
+  const { model, prompt, workspacePath, currentCwd, recentHistory = [] } = req.body;
+  if (!model || !prompt) {
+    return res.status(400).json({ error: 'model and prompt are required' });
+  }
+
+  const targetWorkspace = workspacePath || process.cwd();
+  const activeWorkingDir = currentCwd || workspaceCwdMap.get(targetWorkspace) || targetWorkspace;
+
+  // 1. Workspace context scan
+  const tree = buildFileTree(targetWorkspace, 0, 2);
+  const fileListSnippet = tree.map((t) => (t.isDirectory ? `📁 ${t.name}/` : `📄 ${t.name}`)).slice(0, 35).join('\n');
+
+  let manifestInfo = '';
+  const pkgPath = path.join(targetWorkspace, 'package.json');
+  if (fs.existsSync(pkgPath)) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+      manifestInfo += `Project: ${pkg.name || 'app'} | Dependencies: ${Object.keys({ ...pkg.dependencies, ...pkg.devDependencies }).slice(0, 15).join(', ')}`;
+    } catch (e) {}
+  }
+
+  const historySnippet = Array.isArray(recentHistory) && recentHistory.length > 0
+    ? `\nRECENT CONVERSATION CONTEXT:\n${recentHistory.slice(-4).map((m) => `${m.role.toUpperCase()}: ${m.content.slice(0, 150)}`).join('\n')}\n`
+    : '';
+
+  const interpreterPrompt = `You are the Intent Interpretation Engine of Aria IDE.
+Before any code generation, plan creation, or command execution occurs, you must analyze the user's input to determine their precise intent.
+
+USER INPUT:
+"${prompt}"
+
+WORKSPACE CONTEXT:
+Active Directory: ${activeWorkingDir}
+Existing Workspace Files:
+${fileListSnippet || '(Empty directory)'}
+${manifestInfo ? `Manifest: ${manifestInfo}` : ''}
+${historySnippet}
+INSTRUCTIONS:
+1. Determine the user's intent category:
+   - "implementation": User wants to build, create, scaffold, or implement a feature/component/application.
+   - "modification": User wants to edit, update, style, or refactor existing code.
+   - "bugfix": User wants to fix an error, bug, failure, or broken functionality.
+   - "investigation": User wants to inspect, audit, review code, or understand how something works in this workspace.
+   - "terminal_command": User wants to run a specific command (e.g., install dependencies, run dev server, build, git).
+   - "question": User is asking a conceptual, technical, or general programming question (no file changes needed).
+
+2. Formulate:
+   - "coreObjective": 1 concise, direct sentence describing what the user wants to achieve.
+   - "targetScope": array of 1 to 5 relevant files, components, or folders that are targeted or affected.
+   - "proposedStrategy": 2 concise sentences explaining the approach or solution strategy.
+   - "isActionable": true if the request requires creating/modifying files or running build/install commands; false if it's a question, inquiry, or explanation.
+   - "confidence": "high", "medium", or "low".
+
+OUTPUT FORMAT:
+Respond with ONLY valid JSON inside a \`\`\`json code block, with NO other commentary:
+\`\`\`json
+{
+  "intentType": "implementation",
+  "coreObjective": "...",
+  "targetScope": ["file1", "file2"],
+  "proposedStrategy": "...",
+  "isActionable": true,
+  "confidence": "high"
+}
+\`\`\``;
+
+  try {
+    await ensureOnlyTargetModelLoaded(model);
+
+    const ollamaRes = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: 'system', content: 'You are the Aria IDE Intent Interpretation Engine. Return only valid JSON in ```json blocks.' },
+          { role: 'user', content: interpreterPrompt },
+        ],
+        stream: false,
+        options: {
+          temperature: 0.1,
+          num_predict: 800,
+        },
+      }),
+    });
+
+    if (!ollamaRes.ok) {
+      throw new Error(`Ollama error: ${await ollamaRes.text()}`);
+    }
+
+    const data = await ollamaRes.json();
+    const content = data.message?.content || '';
+
+    let parsed = null;
+    const jsonMatch = content.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+    if (jsonMatch) {
+      try {
+        parsed = JSON.parse(jsonMatch[1]);
+      } catch (e) {}
+    }
+
+    if (!parsed) {
+      const braceMatch = content.match(/\{[\s\S]*\}/);
+      if (braceMatch) {
+        try {
+          parsed = JSON.parse(braceMatch[0]);
+        } catch (e) {}
+      }
+    }
+
+    if (!parsed || !parsed.intentType) {
+      const isActionableHeuristic = /(\b(build|create|make|code|write|implement|scaffold|setup|develop|add|fix|refactor|install|generate)\b)/i.test(prompt);
+      parsed = {
+        intentType: isActionableHeuristic ? 'implementation' : 'question',
+        coreObjective: prompt.slice(0, 100),
+        targetScope: [],
+        proposedStrategy: isActionableHeuristic
+          ? 'Analyze project structure and execute the requested implementation.'
+          : 'Provide a direct explanation to answer the user query.',
+        isActionable: isActionableHeuristic,
+        confidence: 'medium',
+      };
+    }
+
+    res.json({
+      success: true,
+      interpretation: {
+        intentType: parsed.intentType || 'implementation',
+        coreObjective: parsed.coreObjective || prompt,
+        targetScope: Array.isArray(parsed.targetScope) ? parsed.targetScope : [],
+        proposedStrategy: parsed.proposedStrategy || '',
+        isActionable: Boolean(parsed.isActionable),
+        confidence: parsed.confidence || 'high',
+      },
+    });
+  } catch (err) {
+    const isActionable = /(\b(build|create|make|code|write|implement|scaffold|setup|develop|add|fix|refactor|install|generate)\b)/i.test(prompt);
+    res.json({
+      success: true,
+      interpretation: {
+        intentType: isActionable ? 'implementation' : 'question',
+        coreObjective: prompt.slice(0, 100),
+        targetScope: [],
+        proposedStrategy: isActionable ? 'Proceed with implementation plan.' : 'Provide direct response.',
+        isActionable,
+        confidence: 'medium',
+      },
+    });
+  }
+});
+
 // Endpoint: Generate Implementation Plan and write IMPLEMENTATION_PLAN.md to disk
 app.post('/api/agent/plan', async (req, res) => {
-  const { model, prompt, workspacePath } = req.body;
+  const { model, prompt, workspacePath, interpretation } = req.body;
   if (!model || !prompt) {
     return res.status(400).json({ error: 'model and prompt are required' });
   }
@@ -2420,6 +2574,14 @@ app.post('/api/agent/plan', async (req, res) => {
   const tree = buildFileTree(targetWorkspace, 0, 2);
   const fileListSnippet = tree.map((t) => (t.isDirectory ? `📁 ${t.name}/` : `📄 ${t.name}`)).join('\n');
 
+  const interpretationSnippet = interpretation ? `
+INTERPRETED INTENT & OBJECTIVE:
+Category: ${interpretation.intentType}
+Core Objective: ${interpretation.coreObjective}
+${interpretation.targetScope && interpretation.targetScope.length > 0 ? `Target Scope: ${interpretation.targetScope.join(', ')}` : ''}
+${interpretation.proposedStrategy ? `Proposed Strategy: ${interpretation.proposedStrategy}` : ''}
+` : '';
+
   const architectPrompt = `You are the Lead Software Architect of Aria IDE.
 Target workspace directory: ${targetWorkspace}
 Existing files in workspace:
@@ -2427,6 +2589,7 @@ ${fileListSnippet || '(Empty workspace)'}
 
 USER REQUEST:
 "${prompt}"
+${interpretationSnippet}
 
 CRITICAL ARCHITECT RULES:
 1. ALWAYS CHECK WHAT IS ALREADY IN THE FOLDER: Inspect "Existing files in workspace" above. Determine what has already been done before generating phases.

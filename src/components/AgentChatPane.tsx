@@ -27,6 +27,7 @@ import {
   FileCode,
   Pause,
   Folder,
+  Compass,
 } from 'lucide-react';
 import { runTerminalCommand, readFileContent, saveFileContent } from '../services/api';
 import { promptText } from '../services/alerts';
@@ -583,6 +584,91 @@ export const AgentChatPane: React.FC<Props> = ({
                   </div>
                   {(expandedThinking[msg.id] ?? true) && (
                     <div className="thinking-body">{msg.thinking}</div>
+                  )}
+                </div>
+              )}
+
+              {/* Intent Interpretation Card */}
+              {msg.intentInterpretation && (
+                <div style={{
+                  marginBottom: 12,
+                  padding: '12px 14px',
+                  borderRadius: 8,
+                  background: 'rgba(255, 255, 255, 0.03)',
+                  border: '1px solid rgba(255, 255, 255, 0.08)',
+                  borderLeft: '3px solid var(--accent-cyan)',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 8,
+                  boxShadow: '0 4px 16px rgba(0, 0, 0, 0.2)',
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <Compass size={14} color="var(--accent-cyan)" />
+                      <span style={{ fontWeight: 700, fontSize: 11.5, color: 'var(--accent-cyan)', letterSpacing: '0.04em' }}>
+                        INTENT INTERPRETATION
+                      </span>
+                    </div>
+                    <span className={`badge ${
+                      msg.intentInterpretation.intentType === 'implementation'
+                        ? 'badge-safe'
+                        : msg.intentInterpretation.intentType === 'bugfix'
+                        ? 'badge-heavy'
+                        : msg.intentInterpretation.intentType === 'modification'
+                        ? 'badge-tight'
+                        : 'badge-safe'
+                    }`} style={{ fontSize: 9.5, textTransform: 'uppercase', padding: '2px 7px' }}>
+                      {msg.intentInterpretation.intentType.replace('_', ' ')}
+                    </span>
+                  </div>
+
+                  {/* Core Objective */}
+                  <div>
+                    <div style={{ fontSize: 10, textTransform: 'uppercase', color: 'var(--text-dim)', fontWeight: 600, marginBottom: 2 }}>
+                      🎯 Core Objective
+                    </div>
+                    <div style={{ fontSize: 12.5, fontWeight: 600, color: 'var(--text-main)', lineHeight: 1.4 }}>
+                      {msg.intentInterpretation.coreObjective}
+                    </div>
+                  </div>
+
+                  {/* Target Scope */}
+                  {msg.intentInterpretation.targetScope && msg.intentInterpretation.targetScope.length > 0 && (
+                    <div>
+                      <div style={{ fontSize: 10, textTransform: 'uppercase', color: 'var(--text-dim)', fontWeight: 600, marginBottom: 4 }}>
+                        📂 Target Scope
+                      </div>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+                        {msg.intentInterpretation.targetScope.map((scope, idx) => (
+                          <span
+                            key={idx}
+                            style={{
+                              fontSize: 11,
+                              fontFamily: 'var(--font-mono)',
+                              background: 'rgba(255, 255, 255, 0.05)',
+                              border: '1px solid rgba(255, 255, 255, 0.08)',
+                              padding: '2px 6px',
+                              borderRadius: 4,
+                              color: 'var(--accent-cyan)',
+                            }}
+                          >
+                            {scope}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Proposed Strategy */}
+                  {msg.intentInterpretation.proposedStrategy && (
+                    <div>
+                      <div style={{ fontSize: 10, textTransform: 'uppercase', color: 'var(--text-dim)', fontWeight: 600, marginBottom: 2 }}>
+                        🛠️ Proposed Strategy
+                      </div>
+                      <div style={{ fontSize: 11.5, color: 'var(--text-muted)', lineHeight: 1.45 }}>
+                        {msg.intentInterpretation.proposedStrategy}
+                      </div>
+                    </div>
                   )}
                 </div>
               )}

@@ -149,6 +149,15 @@ export interface ToolExecution {
   audit?: CommandAuditResult;
 }
 
+export interface UserIntentInterpretation {
+  intentType: 'implementation' | 'modification' | 'bugfix' | 'investigation' | 'terminal_command' | 'question';
+  coreObjective: string;
+  targetScope: string[];
+  proposedStrategy: string;
+  isActionable: boolean;
+  confidence?: 'high' | 'medium' | 'low';
+}
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant' | 'system';
@@ -160,6 +169,7 @@ export interface ChatMessage {
   plan?: PlanTask[];
   timestamp: number;
   commandAudit?: CommandAuditResult;
+  intentInterpretation?: UserIntentInterpretation;
   isInterruption?: boolean;
 }
 

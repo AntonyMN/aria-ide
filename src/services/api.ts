@@ -8,6 +8,7 @@ import type {
   ActivityLogItem,
   CommandAuditResult,
   ActiveOllamaModel,
+  UserIntentInterpretation,
 } from '../types';
 
 const API_BASE = 'http://localhost:3001/api';
@@ -334,10 +335,33 @@ export async function stopAgentGeneration(): Promise<boolean> {
   }
 }
 
+export async function interpretUserIntent(params: {
+  model: string;
+  prompt: string;
+  workspacePath: string;
+  currentCwd?: string;
+  recentHistory?: { role: string; content: string }[];
+}): Promise<{
+  success: boolean;
+  interpretation: UserIntentInterpretation;
+}> {
+  const res = await fetch(`${API_BASE}/agent/interpret`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(err || 'Failed to interpret user intent');
+  }
+  return res.json();
+}
+
 export async function generateImplementationPlan(params: {
   model: string;
   prompt: string;
   workspacePath: string;
+  interpretation?: UserIntentInterpretation;
 }): Promise<{
   success: boolean;
   planMarkdown: string;

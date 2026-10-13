@@ -23,6 +23,7 @@ import {
   stopAgentGeneration,
   generateImplementationPlan,
   executeAgentStep,
+  interpretUserIntent,
   verifyWorkspaceFiles,
   fetchWorkspaceSession,
   saveWorkspaceSession,
@@ -1776,13 +1777,55 @@ Output ONLY the file code inside:
     setMessages((prev) => [...prev, userMsg]);
     setIsStreaming(true);
 
-    const isActionable =
-      options.mode === 'plan' ||
-      /(\b(build|create|make|code|write|implement|scaffold|setup|develop|add|fix|refactor|install|generate)\b)/i.test(prompt);
-
     try {
+      // =========================================================================
+      // STEP 1: LAYER OF INTERPRETATION (Determine what the user intends before implementation)
+      // =========================================================================
+      const interpretMsgId = `interpret-${Date.now()}`;
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: interpretMsgId,
+          role: 'assistant',
+          content: '🧠 **Analyzing project context & interpreting intent...**',
+          isStreaming: true,
+          timestamp: Date.now(),
+        },
+      ]);
+
+      const interpretationResult = await interpretUserIntent({
+        model: selectedModel,
+        prompt,
+        workspacePath,
+        currentCwd,
+        recentHistory: messages.slice(-4).map((m) => ({ role: m.role, content: m.content })),
+      });
+
+      const interpretation = interpretationResult.interpretation;
+
+      // Update interpretation message with the structured card
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === interpretMsgId
+            ? {
+                ...m,
+                content: '',
+                intentInterpretation: interpretation,
+                isStreaming: false,
+              }
+            : m
+        )
+      );
+
+      if (abortControllerRef.current?.signal.aborted) return;
+
+      const isActionable =
+        options.mode === 'plan' ||
+        interpretation.isActionable ||
+        ['implementation', 'modification', 'bugfix'].includes(interpretation.intentType);
+
       if (!isActionable) {
-        // Standard conversational interaction
+        // Conversational, investigative, or conceptual query
         const assistantMsgId = `asst-${Date.now()}`;
         setMessages((prev) => [
           ...prev,
@@ -1798,20 +1841,8 @@ Output ONLY the file code inside:
 
         await streamAgentTask(prompt, assistantMsgId, {
           thinkingEnabled: options.thinkingEnabled,
-          autoApplyFiles: true,
-          autoExecuteCommands: true,
-          onFileWritten: (file) => {
-            loadWorkspace();
-            handleSelectFile(file.fullPath);
-            showSuccessToast(`Created ${file.path}`);
-          },
-          onCommandExecuted: (cmd) => {
-            if (cmd.hasError) {
-              showWarningAlert('Command Error', `Command "${cmd.command}" failed.`);
-            } else {
-              showSuccessToast(`Ran: ${cmd.command}`);
-            }
-          },
+          autoApplyFiles: false,
+          autoExecuteCommands: false,
         });
 
         setMessages((prev) =>
@@ -1819,9 +1850,9 @@ Output ONLY the file code inside:
         );
       } else {
         // =========================================================================
-        // AUTONOMOUS STEP-BY-STEP IMPLEMENTATION PIPELINE
+        // STEP 2: AUTONOMOUS STEP-BY-STEP IMPLEMENTATION PIPELINE
         // =========================================================================
-        // Step 1: Prompt LLM to break task into detailed plan & write out on Monaco
+        // Prompt LLM to break task into detailed plan & write out on Monaco
         const planMsgId = `plan-msg-${Date.now()}`;
         setMessages((prev) => [
           ...prev,
@@ -1838,6 +1869,7 @@ Output ONLY the file code inside:
           model: selectedModel,
           prompt,
           workspacePath,
+          interpretation,
         });
 
         if (abortControllerRef.current?.signal.aborted) return;
@@ -1862,7 +1894,7 @@ Output ONLY the file code inside:
           )
         );
 
-        // Step 2: Initialize activePlan state and run Step-by-Step Autonomous Execution Loop
+        // Step 3: Initialize activePlan state and run Step-by-Step Autonomous Execution Loop
         const newPlanState: ActivePlanExecution = {
           prompt,
           phases: planResult.phases,

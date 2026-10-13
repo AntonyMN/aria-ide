@@ -134,6 +134,28 @@ export function App() {
   // Agent Chat State
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
+  const messagesRef = useRef<ChatMessage[]>([]);
+
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
+  const getCleanConversationHistory = (extraUserMsg?: ChatMessage): { role: string; content: string }[] => {
+    const list = extraUserMsg ? [...messagesRef.current, extraUserMsg] : messagesRef.current;
+    return list
+      .filter((m) => {
+        if (!m.content || !m.content.trim()) return false;
+        if (m.content.startsWith('⏳ **Please wait as model is being booted')) return false;
+        if (m.content.startsWith('🧠 **Analyzing project context')) return false;
+        if (m.content.startsWith('❌ Error:')) return false;
+        return m.role === 'user' || m.role === 'assistant';
+      })
+      .slice(-10)
+      .map((m) => ({
+        role: m.role,
+        content: m.content.trim(),
+      }));
+  };
 
   // Resizable Panels State
   const [leftSidebarWidth, setLeftSidebarWidth] = useState<number>(() => {
@@ -744,6 +766,7 @@ export function App() {
     completedActions: any[];
     lastActionResult: any;
     thinkingEnabled: boolean;
+    conversationHistory?: { role: string; content: string }[];
   } | null>(null);
 
   // Stop Generation with SweetAlert2 confirmation
@@ -989,10 +1012,7 @@ export function App() {
           return tab ? { path: tab.path, content: tab.content } : undefined;
         })(),
         openTabs: tabs.map((t) => ({ path: t.path, name: t.name })),
-        conversationHistory: messages.map((m) => ({
-          role: m.role,
-          content: m.content,
-        })),
+        conversationHistory: getCleanConversationHistory(),
       }),
     });
 
@@ -1201,7 +1221,8 @@ export function App() {
     thinkingEnabled: boolean,
     startStepIndex = 1,
     existingActions: any[] = [],
-    initialLastResult: any = null
+    initialLastResult: any = null,
+    passedConversationHistory?: { role: string; content: string }[]
   ) => {
     if (!selectedModel) {
       await showWarningAlert('Model Required', 'Please select a local AI model before executing.');
@@ -1230,6 +1251,7 @@ export function App() {
     let lastActionResult = initialLastResult;
     let stepIndex = startStepIndex;
     const maxSteps = 30;
+    const convHistory = passedConversationHistory || getCleanConversationHistory();
 
     activeAutonomousTaskRef.current = {
       prompt: planPrompt,
@@ -1239,6 +1261,7 @@ export function App() {
       completedActions,
       lastActionResult,
       thinkingEnabled,
+      conversationHistory: convHistory,
     };
 
     try {
@@ -1283,6 +1306,7 @@ export function App() {
             workspacePath,
             currentCwd,
             thinkingEnabled,
+            conversationHistory: convHistory,
           },
           {
             onChunk: (chunk, isThinking) => {
@@ -1667,7 +1691,8 @@ Output ONLY the file code inside:
         task.thinkingEnabled,
         task.stepIndex,
         task.completedActions,
-        task.lastActionResult
+        task.lastActionResult,
+        task.conversationHistory
       );
       return;
     }
@@ -1776,8 +1801,11 @@ Output ONLY the file code inside:
       content: prompt,
       timestamp: Date.now(),
     };
+    messagesRef.current = [...messagesRef.current, userMsg];
     setMessages((prev) => [...prev, userMsg]);
     setIsStreaming(true);
+
+    const historyForLlm = getCleanConversationHistory();
 
     try {
       // =========================================================================
@@ -1800,7 +1828,7 @@ Output ONLY the file code inside:
         prompt,
         workspacePath,
         currentCwd,
-        recentHistory: messages.slice(-4).map((m) => ({ role: m.role, content: m.content })),
+        conversationHistory: historyForLlm,
       });
 
       const interpretation = interpretationResult.interpretation;
@@ -1872,6 +1900,7 @@ Output ONLY the file code inside:
           prompt,
           workspacePath,
           interpretation,
+          conversationHistory: historyForLlm,
         });
 
         if (abortControllerRef.current?.signal.aborted) return;
@@ -1910,7 +1939,11 @@ Output ONLY the file code inside:
           prompt,
           planResult.planMarkdown,
           planResult.tasks,
-          options.thinkingEnabled
+          options.thinkingEnabled,
+          1,
+          [],
+          null,
+          historyForLlm
         );
       }
     } catch (err: any) {
@@ -2289,7 +2322,8 @@ Output ONLY the file code inside:
                         task.thinkingEnabled,
                         task.stepIndex,
                         task.completedActions,
-                        task.lastActionResult
+                        task.lastActionResult,
+                        task.conversationHistory
                       );
                       return;
                     }

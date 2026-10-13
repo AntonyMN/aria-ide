@@ -2412,7 +2412,7 @@ Summary of how the architecture and plan adapt to: "${interruptionMessage}".
 // Endpoint: User Intent Interpretation Layer
 // Analyzes user prompt, workspace context, and conversation history before any implementation begins.
 app.post('/api/agent/interpret', async (req, res) => {
-  const { model, prompt, workspacePath, currentCwd, recentHistory = [] } = req.body;
+  const { model, prompt, workspacePath, currentCwd, recentHistory = [], conversationHistory } = req.body;
   if (!model || !prompt) {
     return res.status(400).json({ error: 'model and prompt are required' });
   }
@@ -2433,8 +2433,40 @@ app.post('/api/agent/interpret', async (req, res) => {
     } catch (e) {}
   }
 
-  const historySnippet = Array.isArray(recentHistory) && recentHistory.length > 0
-    ? `\nRECENT CONVERSATION CONTEXT:\n${recentHistory.slice(-4).map((m) => `${m.role.toUpperCase()}: ${m.content.slice(0, 150)}`).join('\n')}\n`
+  // Check if IMPLEMENTATION_PLAN.md exists on disk
+  let planSummary = '';
+  const planPath = path.join(targetWorkspace, 'IMPLEMENTATION_PLAN.md');
+  if (fs.existsSync(planPath)) {
+    try {
+      const planText = fs.readFileSync(planPath, 'utf8');
+      planSummary = `\nExisting IMPLEMENTATION_PLAN.md on disk:\n${planText.slice(0, 1200)}\n`;
+    } catch (e) {}
+  }
+
+  // Check recent activities from .ide/activity.json
+  let recentActivities = '';
+  const actPath = path.join(targetWorkspace, '.ide', 'activity.json');
+  if (fs.existsSync(actPath)) {
+    try {
+      const acts = JSON.parse(fs.readFileSync(actPath, 'utf8'));
+      const lastActs = acts.slice(-4);
+      if (lastActs.length > 0) {
+        recentActivities = `\nRecent actions:\n${lastActs.map((a) => `- [${a.type}] ${a.command || a.path || a.title || ''} (Success: ${a.success ?? 'N/A'})`).join('\n')}\n`;
+      }
+    } catch (e) {}
+  }
+
+  // Conversation history: support both conversationHistory and recentHistory up to 10 turns
+  const historyList = Array.isArray(conversationHistory) && conversationHistory.length > 0
+    ? conversationHistory
+    : (Array.isArray(recentHistory) ? recentHistory : []);
+
+  const cleanHistory = historyList
+    .filter((m) => m && m.content && m.content.trim())
+    .slice(-10);
+
+  const historySnippet = cleanHistory.length > 0
+    ? `\nPRIOR CONVERSATION TRANSCRIPT (CONTINUATION MEMORY):\n${cleanHistory.map((m) => `${m.role.toUpperCase()}: ${m.content.slice(0, 500)}`).join('\n\n')}\n`
     : '';
 
   const interpreterPrompt = `You are the Intent Interpretation Engine of Aria IDE.
@@ -2448,12 +2480,15 @@ Active Directory: ${activeWorkingDir}
 Existing Workspace Files:
 ${fileListSnippet || '(Empty directory)'}
 ${manifestInfo ? `Manifest: ${manifestInfo}` : ''}
+${planSummary}
+${recentActivities}
 ${historySnippet}
 INSTRUCTIONS:
-1. Determine the user's intent category:
+1. Context Continuation: If the user references earlier conversation (e.g., "recover the situation", "it failed", "continue", "show me what we did", "proceed"), resolve the referents and context using the PRIOR CONVERSATION TRANSCRIPT, existing files, and recent actions above!
+2. Determine the user's intent category:
    - "implementation": User wants to build, create, scaffold, or implement a feature/component/application.
    - "modification": User wants to edit, update, style, or refactor existing code.
-   - "bugfix": User wants to fix an error, bug, failure, or broken functionality.
+   - "bugfix": User wants to fix an error, bug, failure, or broken functionality (including recovering from an error or failed command).
    - "investigation": User wants to inspect, audit, review code, or understand how something works in this workspace.
    - "terminal_command": User wants to run a specific command (e.g., install dependencies, run dev server, build, git).
    - "question": User is asking a conceptual, technical, or general programming question (no file changes needed).
@@ -2523,7 +2558,7 @@ Respond with ONLY valid JSON inside a \`\`\`json code block, with NO other comme
     }
 
     if (!parsed || !parsed.intentType) {
-      const isActionableHeuristic = /(\b(build|create|make|code|write|implement|scaffold|setup|develop|add|fix|refactor|install|generate)\b)/i.test(prompt);
+      const isActionableHeuristic = /(\b(build|create|make|code|write|implement|scaffold|setup|develop|add|fix|refactor|install|generate|recover|retry|resume|continue|execute|apply)\b)/i.test(prompt);
       parsed = {
         intentType: isActionableHeuristic ? 'implementation' : 'question',
         coreObjective: prompt.slice(0, 100),
@@ -2548,7 +2583,7 @@ Respond with ONLY valid JSON inside a \`\`\`json code block, with NO other comme
       },
     });
   } catch (err) {
-    const isActionable = /(\b(build|create|make|code|write|implement|scaffold|setup|develop|add|fix|refactor|install|generate)\b)/i.test(prompt);
+    const isActionable = /(\b(build|create|make|code|write|implement|scaffold|setup|develop|add|fix|refactor|install|generate|recover|retry|resume|continue|execute|apply)\b)/i.test(prompt);
     res.json({
       success: true,
       interpretation: {
@@ -2565,7 +2600,7 @@ Respond with ONLY valid JSON inside a \`\`\`json code block, with NO other comme
 
 // Endpoint: Generate Implementation Plan and write IMPLEMENTATION_PLAN.md to disk
 app.post('/api/agent/plan', async (req, res) => {
-  const { model, prompt, workspacePath, interpretation } = req.body;
+  const { model, prompt, workspacePath, interpretation, conversationHistory = [], recentHistory = [] } = req.body;
   if (!model || !prompt) {
     return res.status(400).json({ error: 'model and prompt are required' });
   }
@@ -2573,6 +2608,29 @@ app.post('/api/agent/plan', async (req, res) => {
   const targetWorkspace = workspacePath || process.cwd();
   const tree = buildFileTree(targetWorkspace, 0, 2);
   const fileListSnippet = tree.map((t) => (t.isDirectory ? `📁 ${t.name}/` : `📄 ${t.name}`)).join('\n');
+
+  // Check if IMPLEMENTATION_PLAN.md already exists
+  let existingPlanSnippet = '';
+  const existingPlanPath = path.join(targetWorkspace, 'IMPLEMENTATION_PLAN.md');
+  if (fs.existsSync(existingPlanPath)) {
+    try {
+      const existingPlanText = fs.readFileSync(existingPlanPath, 'utf8');
+      existingPlanSnippet = `\nPREVIOUS IMPLEMENTATION_PLAN.md ON DISK:\n${existingPlanText.slice(0, 1500)}\n`;
+    } catch (e) {}
+  }
+
+  // Conversation history: include prior conversation context for multi-turn continuation
+  const historyList = Array.isArray(conversationHistory) && conversationHistory.length > 0
+    ? conversationHistory
+    : (Array.isArray(recentHistory) ? recentHistory : []);
+
+  const cleanHistory = historyList
+    .filter((m) => m && m.content && m.content.trim())
+    .slice(-10);
+
+  const historySnippet = cleanHistory.length > 0
+    ? `\nPRIOR CONVERSATION TRANSCRIPT (CONTINUATION MEMORY):\n${cleanHistory.map((m) => `${m.role.toUpperCase()}: ${m.content.slice(0, 600)}`).join('\n\n')}\n`
+    : '';
 
   const interpretationSnippet = interpretation ? `
 INTERPRETED INTENT & OBJECTIVE:
@@ -2586,15 +2644,17 @@ ${interpretation.proposedStrategy ? `Proposed Strategy: ${interpretation.propose
 Target workspace directory: ${targetWorkspace}
 Existing files in workspace:
 ${fileListSnippet || '(Empty workspace)'}
-
+${existingPlanSnippet}
+${historySnippet}
 USER REQUEST:
 "${prompt}"
 ${interpretationSnippet}
 
 CRITICAL ARCHITECT RULES:
-1. ALWAYS CHECK WHAT IS ALREADY IN THE FOLDER: Inspect "Existing files in workspace" above. Determine what has already been done before generating phases.
-2. DO NOT RE-INITIALIZE: If a project folder, framework, or configuration files (such as package.json, composer.json, Cargo.toml) already exist, do NOT schedule steps to re-create or re-initialize them.
-3. DETERMINE HOW TO PROCEED: Build upon the existing state and outline the exact steps to proceed from there.
+1. CONTINUATION & RECOVERY: If the user request or conversation indicates continuing from a prior phase or recovering from a previous failure, build directly upon what is already done and tailor this plan to resolve the situation.
+2. ALWAYS CHECK WHAT IS ALREADY IN THE FOLDER: Inspect "Existing files in workspace" above. Determine what has already been done before generating phases.
+3. DO NOT RE-INITIALIZE: If a project folder, framework, or configuration files (such as package.json, composer.json, Cargo.toml) already exist, do NOT schedule steps to re-create or re-initialize them.
+4. DETERMINE HOW TO PROCEED: Build upon the existing state and outline the exact steps to proceed from there.
 
 Break this task down into 2 to 4 clear, logical, sequential PHASES.
 Your response MUST be a detailed Markdown Implementation Plan following this exact format:
@@ -2756,6 +2816,8 @@ app.post('/api/agent/step', async (req, res) => {
     workspacePath,
     currentCwd,
     thinkingEnabled = false,
+    conversationHistory = [],
+    recentHistory = [],
   } = req.body;
 
   if (!model || !planPrompt) {
@@ -2823,6 +2885,18 @@ You MUST incorporate these instructions immediately into your ongoing implementa
 ======================================================================\n`
       : '';
 
+    const historyList = Array.isArray(conversationHistory) && conversationHistory.length > 0
+      ? conversationHistory
+      : (Array.isArray(recentHistory) ? recentHistory : []);
+
+    const cleanHistory = historyList
+      .filter((m) => m && m.content && m.content.trim())
+      .slice(-8);
+
+    const historySnippet = cleanHistory.length > 0
+      ? `\nRECENT CONVERSATION HISTORY (USER & AGENT CONTEXT):\n${cleanHistory.map((m) => `${m.role.toUpperCase()}: ${m.content.slice(0, 400)}`).join('\n')}\n`
+      : '';
+
     const previousActionSnippet = lastActionResult
       ? `Type: ${lastActionResult.type} | Target: ${lastActionResult.target || lastActionResult.path || lastActionResult.command} | Success: ${lastActionResult.success}
 ${lastActionResult.stdout ? `Terminal Stdout:\n${lastActionResult.stdout.slice(0, 600)}\n` : ''}
@@ -2856,6 +2930,7 @@ ${fileListSnippet || '(Empty workspace)'}
 ${manifestInfo}
 ${ideContextSnippet}
 ${guidanceSnippet}
+${historySnippet}
 OPERATIONAL RULES:
 1. Examine what is ALREADY in the folder before issuing any command. Never re-initialize scaffolding if already initialized!
 2. If the previous command had an error (missing dependency, failed build, syntax issue), fix it immediately.
@@ -3291,25 +3366,54 @@ The Aria backend will automatically create the files on disk and execute the com
       systemInstruction += `\nInclude deep reasoning steps inside <think>...</think> tags before writing your answer.`;
     }
 
-    // Smart context pruning: sanitizes generic AI boilerplate and compresses large code blocks
-    const prunedMessages = [{ role: 'system', content: systemInstruction }];
-    const recentHistory = (conversationHistory || []).slice(-4);
-    for (const msg of recentHistory) {
-      let content = msg.content || '';
+    // Smart context pruning: sanitizes generic AI boilerplate, preserves up to 10 conversation turns, and ensures proper alternating roles
+    const rawHistory = Array.isArray(conversationHistory) ? conversationHistory.slice(-10) : [];
+    const sanitizedHistory = [];
+
+    for (const msg of rawHistory) {
+      if (!msg || !msg.content || !msg.content.trim()) continue;
+      let content = msg.content;
       // Strip generic canned AI disclaimers so small models don't mimic them
       content = content.replace(/I apologize, but as an AI language model[^\n]*/gi, '');
       content = content.replace(/as an AI language model, I do not have access[^\n]*/gi, '');
       content = content.replace(/Please provide me with the implementation plan document[^\n]*/gi, '');
-      if (content.length > 2000) {
+      content = content.replace(/I am an AI assistant and I do not have[^\n]*/gi, '');
+      if (content.length > 2500) {
         content = content.replace(/```(?:file:[^\n]+|[\w]+)?\n([\s\S]{250,}?)```/g, () => {
           return '```\n[Code block omitted: file already synced to disk]\n```';
         });
       }
       if (content.trim()) {
-        prunedMessages.push({ role: msg.role, content: content.trim() });
+        sanitizedHistory.push({
+          role: msg.role === 'assistant' ? 'assistant' : 'user',
+          content: content.trim(),
+        });
       }
     }
-    prunedMessages.push({ role: 'user', content: prompt });
+
+    // Ensure the conversation ends with the current user prompt
+    const lastHist = sanitizedHistory[sanitizedHistory.length - 1];
+    if (!lastHist || lastHist.role !== 'user' || lastHist.content !== prompt.trim()) {
+      sanitizedHistory.push({ role: 'user', content: prompt });
+    }
+
+    const prunedMessages = [{ role: 'system', content: systemInstruction }];
+
+    // Merge any adjacent messages with identical roles so Ollama gets clean alternating turns:
+    // system -> user -> assistant -> user -> assistant -> user
+    for (const msg of sanitizedHistory) {
+      const prevMsg = prunedMessages[prunedMessages.length - 1];
+      if (prevMsg && prevMsg.role === msg.role && prevMsg.role !== 'system') {
+        prevMsg.content += `\n\n${msg.content}`;
+      } else {
+        prunedMessages.push({ role: msg.role, content: msg.content });
+      }
+    }
+
+    // Double check that the final message is from user
+    if (prunedMessages[prunedMessages.length - 1].role !== 'user') {
+      prunedMessages.push({ role: 'user', content: prompt });
+    }
 
     sendEvent('status', { status: 'Connecting to local LLM...' });
 

@@ -341,6 +341,7 @@ export async function interpretUserIntent(params: {
   workspacePath: string;
   currentCwd?: string;
   recentHistory?: { role: string; content: string }[];
+  conversationHistory?: { role: string; content: string }[];
 }): Promise<{
   success: boolean;
   interpretation: UserIntentInterpretation;
@@ -362,6 +363,7 @@ export async function generateImplementationPlan(params: {
   prompt: string;
   workspacePath: string;
   interpretation?: UserIntentInterpretation;
+  conversationHistory?: { role: string; content: string }[];
 }): Promise<{
   success: boolean;
   planMarkdown: string;
@@ -659,6 +661,7 @@ export async function executeAgentStep(
     workspacePath: string;
     currentCwd: string;
     thinkingEnabled?: boolean;
+    conversationHistory?: { role: string; content: string }[];
   },
   callbacks: AgentStepCallbacks,
   signal?: AbortSignal

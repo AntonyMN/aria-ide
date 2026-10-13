@@ -339,6 +339,40 @@ export const OnScreenCommandRunner: React.FC<Props> = ({
                 </div>
               )}
 
+              {/* What Has Been Done in Folder */}
+              {activeItem.audit.whatHasBeenDone && (
+                <div style={{
+                  fontSize: 11.5,
+                  color: '#93c5fd',
+                  display: 'flex',
+                  alignItems: 'flex-start',
+                  gap: 6,
+                  background: 'rgba(59, 130, 246, 0.08)',
+                  padding: '4px 8px',
+                  borderRadius: 4,
+                  borderLeft: '2px solid #3b82f6',
+                  marginTop: 2,
+                }}>
+                  <div>
+                    <strong style={{ color: '#60a5fa' }}>Folder Status & What Has Been Done: </strong>
+                    {activeItem.audit.whatHasBeenDone}
+                  </div>
+                </div>
+              )}
+
+              {/* Items Already In Folder */}
+              {activeItem.audit.existingItems && activeItem.audit.existingItems.length > 0 && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 5, flexWrap: 'wrap', fontSize: 10.5, color: 'var(--text-dim)' }}>
+                  <span>Already in folder:</span>
+                  {activeItem.audit.existingItems.slice(0, 10).map((it) => (
+                    <span key={it} style={{ background: 'rgba(255, 255, 255, 0.05)', padding: '1px 5px', borderRadius: 3, fontFamily: 'var(--font-mono)' }}>{it}</span>
+                  ))}
+                  {activeItem.audit.existingItems.length > 10 && (
+                    <span>+{activeItem.audit.existingItems.length - 10} more</span>
+                  )}
+                </div>
+              )}
+
               {/* Way Forward from LLM */}
               {activeItem.audit.wayForward && (
                 <div style={{

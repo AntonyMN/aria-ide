@@ -90,6 +90,8 @@ export interface CommandAuditResult {
   createdFiles: string[];
   status: 'success' | 'warning' | 'error';
   summary: string;
+  whatHasBeenDone?: string;
+  existingItems?: string[];
   wayForward: string;
   suggestedNextCommands: string[];
 }

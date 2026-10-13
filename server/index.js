@@ -619,13 +619,35 @@ async function auditCommandAndStructure({
   const targetWorkspace = workspacePath || process.cwd();
   const currentDir = currentCwd || targetWorkspace;
 
-  // 1. Inspect newly created directories in detail (e.g. files inside newly created 'blog')
+  // 1. Inspect what is ALREADY in the current directory and identify existing project markers
+  let existingItems = [];
+  try {
+    if (fs.existsSync(currentDir) && fs.statSync(currentDir).isDirectory()) {
+      existingItems = fs.readdirSync(currentDir).slice(0, 40);
+    }
+  } catch (e) {}
+
+  const detectedMarkers = [];
+  if (fs.existsSync(path.join(currentDir, 'composer.json'))) detectedMarkers.push('composer.json (PHP/Composer dependencies defined)');
+  if (fs.existsSync(path.join(currentDir, 'artisan'))) detectedMarkers.push('artisan (Laravel Framework detected)');
+  if (fs.existsSync(path.join(currentDir, 'package.json'))) detectedMarkers.push('package.json (Node/JS/TS dependencies defined)');
+  if (fs.existsSync(path.join(currentDir, 'node_modules'))) detectedMarkers.push('node_modules (JS packages installed)');
+  if (fs.existsSync(path.join(currentDir, 'vendor'))) detectedMarkers.push('vendor (Composer packages installed)');
+  if (fs.existsSync(path.join(currentDir, '.env'))) detectedMarkers.push('.env (Environment file present)');
+  if (fs.existsSync(path.join(currentDir, '.env.example'))) detectedMarkers.push('.env.example (Environment template present)');
+  if (fs.existsSync(path.join(currentDir, 'Cargo.toml'))) detectedMarkers.push('Cargo.toml (Rust project)');
+  if (fs.existsSync(path.join(currentDir, 'requirements.txt'))) detectedMarkers.push('requirements.txt (Python dependencies)');
+  if (fs.existsSync(path.join(currentDir, 'pyproject.toml'))) detectedMarkers.push('pyproject.toml (Python project)');
+  if (fs.existsSync(path.join(currentDir, 'go.mod'))) detectedMarkers.push('go.mod (Go module)');
+  if (fs.existsSync(path.join(currentDir, '.git'))) detectedMarkers.push('.git (Git initialized)');
+
+  // Also inspect newly created directories in detail (e.g. files inside newly created 'blog')
   let subDirDetails = '';
   for (const dirName of createdDirs.slice(0, 3)) {
     const subPath = path.join(currentDir, dirName);
     if (fs.existsSync(subPath) && fs.statSync(subPath).isDirectory()) {
       try {
-        const subEntries = fs.readdirSync(subPath).slice(0, 15);
+        const subEntries = fs.readdirSync(subPath).slice(0, 20);
         subDirDetails += `\nContents of newly created folder '${dirName}':\n[${subEntries.join(', ')}]\n`;
       } catch (e) {}
     }
@@ -639,6 +661,15 @@ async function auditCommandAndStructure({
       : `Command "${command}" exited with code ${exitCode}.`;
   let fallbackWayForward = '';
   let fallbackNextCommands = [];
+
+  let fallbackWhatHasBeenDone = '';
+  if (detectedMarkers.length > 0) {
+    fallbackWhatHasBeenDone = `Existing markers in folder: ${detectedMarkers.join('; ')}.`;
+  } else if (existingItems.length > 0) {
+    fallbackWhatHasBeenDone = `Folder contains: [${existingItems.slice(0, 10).join(', ')}]`;
+  } else {
+    fallbackWhatHasBeenDone = `Folder is currently empty.`;
+  }
 
   // Detect explicit cd command
   const cdMatch = command.match(/(?:^|&&|;)\s*cd\s+([^;&]+)/);
@@ -664,6 +695,7 @@ async function auditCommandAndStructure({
     if (dirExists) {
       fallbackSuggestedCwd = candidatePath;
       fallbackSummary = `Project folder "${candidateName}" created. Working directory shifted to "${candidateName}".`;
+      fallbackWhatHasBeenDone = `Project folder "${candidateName}" created on disk.`;
       fallbackWayForward = `Navigate into "${candidateName}" and verify scaffolding or install dependencies.`;
 
       if (fs.existsSync(path.join(candidatePath, 'composer.json')) || command.includes('laravel')) {
@@ -679,6 +711,7 @@ async function auditCommandAndStructure({
     const onlyDir = path.resolve(currentDir, createdDirs[0]);
     fallbackSuggestedCwd = onlyDir;
     fallbackSummary = `Created new directory "${createdDirs[0]}". Working directory moved into "${createdDirs[0]}".`;
+    fallbackWhatHasBeenDone = `Created directory "${createdDirs[0]}".`;
     fallbackWayForward = `Enter "${createdDirs[0]}" to proceed with subsequent configuration.`;
   }
 
@@ -693,22 +726,30 @@ WORKING DIRECTORY: ${currentDir}
 EXIT CODE: ${exitCode}
 ${stdout ? `STDOUT (recent output):\n${stdout.slice(-800)}\n` : ''}
 ${stderr ? `STDERR (recent output):\n${stderr.slice(-800)}\n` : ''}
+ITEMS ALREADY IN FOLDER (${currentDir}): [${existingItems.join(', ') || 'Empty folder'}]
+DETECTED PROJECT MARKERS: ${detectedMarkers.join('; ') || 'None'}
 NEW FOLDERS CREATED: ${createdDirs.join(', ') || 'None'}
 NEW FILES CREATED: ${createdFiles.join(', ') || 'None'}
 ${subDirDetails}
 TASK CONTEXT: ${goalContext || 'Sequential task execution'}
 
 CRITICAL AUDIT RULES:
-1. If the command created a new project directory (e.g. "laravel new blog", "npx create-vite-app blog", "cargo new myapp"), the system MUST go inside that folder. Set "suggestedCwd" to that folder name.
-2. Determine if the structure is correct and what the exact WAY FORWARD is.
-3. Suggest the immediate next 1-2 commands to run sequentially.
+1. ALWAYS CHECK WHAT IS ALREADY IN THE FOLDER:
+   Look at "ITEMS ALREADY IN FOLDER" and "DETECTED PROJECT MARKERS".
+   Identify what has ALREADY been done (e.g. project scaffolding created, dependencies installed, configuration created).
+2. DO NOT REPEAT COMPLETED WORK:
+   Never recommend re-running scaffolding (e.g. "laravel new" or "create-vite" or "npm init") or re-creating files that already exist in the folder.
+3. DETERMINE HOW TO PROCEED:
+   Based on what is already present in the folder, determine the exact way forward and the immediate next step.
+4. If the command created a new project directory (e.g. "laravel new blog", "npx create-vite-app blog", "cargo new myapp"), the system MUST go inside that folder. Set "suggestedCwd" to that folder name.
 
 You MUST respond ONLY with a valid JSON object matching this schema:
 {
   "status": "success" | "warning" | "error",
   "summary": "Clear summary of the result and structure changes",
+  "whatHasBeenDone": "Clear explanation of what has already been done in this folder based on existing files",
   "suggestedCwd": "subfolder name or relative path to enter, or null to stay in current directory",
-  "wayForward": "Actionable explanation of current state and what should be done next",
+  "wayForward": "Actionable explanation of current state and what should be done next to proceed",
   "suggestedNextCommands": ["next_command_1", "next_command_2"]
 }`;
 
@@ -779,6 +820,8 @@ You MUST respond ONLY with a valid JSON object matching this schema:
     relativeCwd: finalRelativeCwd,
     createdDirs,
     createdFiles,
+    existingItems,
+    whatHasBeenDone: llmAudit?.whatHasBeenDone || fallbackWhatHasBeenDone,
     status: llmAudit?.status || (exitCode === 0 ? 'success' : 'error'),
     summary: llmAudit?.summary || fallbackSummary,
     wayForward:
@@ -1706,10 +1749,11 @@ USER INTERRUPTION & NEW INSTRUCTIONS:
 EXISTING PLAN PHASES:
 ${activePlan ? JSON.stringify(activePlan.phases || [], null, 2) : 'None'}
 
-TASK:
-1. Audit what has already been created/executed. Do NOT re-create or re-run what is already done and valid.
-2. Adapt and update the remaining phases and sequential commands based on the user's new instructions.
-3. If the user changed the directory, stack, or tools, reflect that in the new phases.
+TASK & FOLDER AUDIT RULES:
+1. ALWAYS CHECK WHAT IS ALREADY IN THE FOLDER: Look at "Current Files in Directory" and "Active Working Directory". Identify what has ALREADY been done (files written, commands run, dependencies configured).
+2. NEVER RE-RUN COMPLETED WORK: Do NOT re-create files or re-run commands that already exist and are valid.
+3. DETERMINE THE EXACT WAY FORWARD: Formulate updated phases that build directly on what is already in the folder, proceeding cleanly to the next necessary actions.
+4. If the user changed the directory, stack, or tools, reflect that in the new phases.
 
 Your response MUST be an updated Phased Implementation Plan following this exact markdown format:
 
@@ -1808,6 +1852,11 @@ ${fileListSnippet || '(Empty workspace)'}
 
 USER REQUEST:
 "${prompt}"
+
+CRITICAL ARCHITECT RULES:
+1. ALWAYS CHECK WHAT IS ALREADY IN THE FOLDER: Inspect "Existing files in workspace" above. Determine what has already been done before generating phases.
+2. DO NOT RE-INITIALIZE: If a project folder, framework, or configuration files (such as package.json, composer.json, Cargo.toml) already exist, do NOT schedule steps to re-create or re-initialize them.
+3. DETERMINE HOW TO PROCEED: Build upon the existing state and outline the exact steps to proceed from there.
 
 Break this task down into 2 to 4 clear, logical, sequential PHASES.
 Your response MUST be a detailed Markdown Implementation Plan following this exact format:
@@ -2054,6 +2103,19 @@ ${activeFile.content.slice(0, 10000)}
 \`\`\`\n`;
     }
 
+    // 4. Active Working Directory & Current Folder Contents
+    const activeWorkingDir = currentCwd || (workspaceCwdMap.get(targetWorkspace) || targetWorkspace);
+    let activeCwdSnippet = '';
+    try {
+      if (fs.existsSync(activeWorkingDir) && fs.statSync(activeWorkingDir).isDirectory()) {
+        const cwdEntries = fs.readdirSync(activeWorkingDir);
+        activeCwdSnippet = `\nCURRENT ACTIVE WORKING DIRECTORY:
+Path: ${activeWorkingDir} (relative: ${path.relative(targetWorkspace, activeWorkingDir) || '.'})
+ITEMS ALREADY IN THIS ACTIVE FOLDER:
+[${cwdEntries.slice(0, 40).join(', ') || 'Empty folder'}]\n`;
+      }
+    } catch (e) {}
+
     let systemInstruction = `You are the Autonomous Software Engineer of the Aria IDE.
 You are running directly on Linux Ubuntu with full access to the project workspace at:
 ${targetWorkspace}
@@ -2064,12 +2126,18 @@ ${manifestInfo}
 ${ideContextSnippet}
 ${existingFilesSnippet}
 ${activeFileSnippet}
+${activeCwdSnippet}
 
 CRITICAL OPERATIONAL RULES:
-1. NEVER instruct the user to run commands or build files manually.
-2. Provide real, complete code without placeholders or omissions.
-3. You have full access to inspect, modify, and build workspace files.
-4. When writing code, use explicit blocks:
+1. MANDATORY FOLDER INSPECTION: Whenever you deal with ANY command or task, ALWAYS check what is already in the folder first.
+   - Inspect the items listed above under "ITEMS ALREADY IN THIS ACTIVE FOLDER".
+   - Find out what has already been done (e.g. project scaffolding created, dependencies installed, configuration files in place, source code written).
+   - NEVER re-run scaffolding (e.g. "laravel new", "create-vite", "npm init", "cargo new") if the project or folder is already initialized!
+   - Find out what has been done and proceed strictly from that current state.
+2. NEVER instruct the user to run commands or build files manually.
+3. Provide real, complete code without placeholders or omissions.
+4. You have full access to inspect, modify, and build workspace files.
+5. When writing code, use explicit blocks:
 \`\`\`file:relative/path/to/file.ext
 [complete code here]
 \`\`\`

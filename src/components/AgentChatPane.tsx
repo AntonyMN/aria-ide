@@ -662,6 +662,41 @@ export const AgentChatPane: React.FC<Props> = ({
                     </div>
                   )}
 
+                  {msg.commandAudit.whatHasBeenDone && (
+                    <div style={{
+                      fontSize: 11.5,
+                      color: '#93c5fd',
+                      background: 'rgba(59, 130, 246, 0.08)',
+                      padding: '5px 8px',
+                      borderRadius: 4,
+                      borderLeft: '2px solid #3b82f6',
+                    }}>
+                      <strong style={{ color: '#60a5fa' }}>Already Done in Folder: </strong>
+                      {msg.commandAudit.whatHasBeenDone}
+                    </div>
+                  )}
+
+                  {msg.commandAudit.existingItems && msg.commandAudit.existingItems.length > 0 && (
+                    <div style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 4,
+                      flexWrap: 'wrap',
+                      fontSize: 10.5,
+                      color: 'var(--text-dim)',
+                    }}>
+                      <span>In folder:</span>
+                      {msg.commandAudit.existingItems.slice(0, 8).map((it) => (
+                        <span key={it} style={{ background: 'rgba(255,255,255,0.05)', padding: '1px 5px', borderRadius: 3, fontFamily: 'var(--font-mono)' }}>
+                          {it}
+                        </span>
+                      ))}
+                      {msg.commandAudit.existingItems.length > 8 && (
+                        <span>+{msg.commandAudit.existingItems.length - 8} more</span>
+                      )}
+                    </div>
+                  )}
+
                   {msg.commandAudit.wayForward && (
                     <div style={{
                       fontSize: 11.5,

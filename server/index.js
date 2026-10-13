@@ -74,6 +74,168 @@ function estimateModelRam(modelSizeBytes, paramSizeStr = '') {
 }
 
 // ==========================================
+// 1.5 OLLAMA MEMORY MANAGEMENT & OFFLOADING ENGINE
+// ==========================================
+
+// Helper: Normalize and compare model names (handles :latest suffix and tag variants)
+function matchModelName(a, b) {
+  if (!a || !b) return false;
+  const cleanA = String(a).trim().toLowerCase();
+  const cleanB = String(b).trim().toLowerCase();
+  if (cleanA === cleanB) return true;
+  if (cleanA === `${cleanB}:latest` || cleanB === `${cleanA}:latest`) return true;
+  const baseA = cleanA.split(':')[0];
+  const baseB = cleanB.split(':')[0];
+  if (baseA === baseB) {
+    if (!cleanA.includes(':') || !cleanB.includes(':')) return true;
+  }
+  return false;
+}
+
+// Helper: Query Ollama /api/ps for models currently loaded in RAM/VRAM
+async function getOllamaActiveModels() {
+  try {
+    const res = await fetch(`${OLLAMA_BASE_URL}/api/ps`, { signal: AbortSignal.timeout(3000) });
+    if (!res.ok) return [];
+    const data = await res.json();
+    if (!Array.isArray(data.models)) return [];
+    return data.models.map((m) => {
+      const sizeBytes = m.size || 0;
+      const sizeVram = m.size_vram || 0;
+      const sizeRam = Math.max(0, sizeBytes - sizeVram);
+      return {
+        name: m.name,
+        model: m.model || m.name,
+        sizeBytes,
+        sizeGB: (sizeBytes / (1024 * 1024 * 1024)).toFixed(2),
+        sizeVramBytes: sizeVram,
+        sizeVramGB: (sizeVram / (1024 * 1024 * 1024)).toFixed(2),
+        sizeRamBytes: sizeRam,
+        sizeRamGB: (sizeRam / (1024 * 1024 * 1024)).toFixed(2),
+        ramGB: (sizeRam / (1024 * 1024 * 1024)).toFixed(2),
+        expiresAt: m.expires_at || '',
+        contextLength: m.context_length || 4096,
+        details: m.details || {},
+      };
+    });
+  } catch (err) {
+    return [];
+  }
+}
+
+// Helper: Offload a specific model by sending keep_alive: 0 and poll /api/ps until verified gone from RAM
+async function offloadModelAndWait(modelName, maxWaitMs = 10000, pollIntervalMs = 200) {
+  const startTime = Date.now();
+  console.log(`[Aria RAM Manager] Initiating offload for model "${modelName}"...`);
+
+  // 1. Send keep_alive: 0 to Ollama via /api/generate
+  try {
+    await fetch(`${OLLAMA_BASE_URL}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: modelName, keep_alive: 0 }),
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch (err) {
+    console.warn(`[Aria RAM Manager] Note on generate keep_alive 0:`, err.message);
+    // Also try /api/chat with keep_alive: 0 as fallback
+    try {
+      await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: modelName, keep_alive: 0, messages: [] }),
+        signal: AbortSignal.timeout(5000),
+      });
+    } catch (e2) {
+      console.warn(`[Aria RAM Manager] Note on chat keep_alive 0:`, e2.message);
+    }
+  }
+
+  // 2. Poll /api/ps until model is confirmed completely gone from RAM
+  let verified = false;
+  let remaining = [];
+  while (Date.now() - startTime < maxWaitMs) {
+    remaining = await getOllamaActiveModels();
+    const stillPresent = remaining.some((m) => matchModelName(m.name, modelName) || matchModelName(m.model, modelName));
+    if (!stillPresent) {
+      verified = true;
+      break;
+    }
+    await new Promise((r) => setTimeout(r, pollIntervalMs));
+  }
+
+  if (!verified) {
+    remaining = await getOllamaActiveModels();
+    const stillPresent = remaining.some((m) => matchModelName(m.name, modelName) || matchModelName(m.model, modelName));
+    if (!stillPresent) {
+      verified = true;
+    }
+  }
+
+  const durationMs = Date.now() - startTime;
+  if (!verified) {
+    console.warn(`[Aria RAM Manager] Timed out waiting for model "${modelName}" to offload from RAM after ${durationMs}ms`);
+  } else {
+    console.log(`[Aria RAM Manager] Verified model "${modelName}" offloaded from RAM in ${durationMs}ms.`);
+  }
+
+  return {
+    success: verified,
+    model: modelName,
+    offloaded: verified,
+    verified,
+    timeTakenMs: durationMs,
+    remainingActiveModels: remaining,
+  };
+}
+
+// Helper: Offload all active models and verify RAM is completely clean
+async function offloadAllModelsAndWait(maxWaitMs = 12000, pollIntervalMs = 200) {
+  const initialActive = await getOllamaActiveModels();
+  if (initialActive.length === 0) {
+    return { success: true, offloadedCount: 0, verified: true, timeTakenMs: 0, remainingActiveModels: [] };
+  }
+
+  const startTime = Date.now();
+  console.log(`[Aria RAM Manager] Offloading all ${initialActive.length} active models from RAM...`);
+  for (const m of initialActive) {
+    await offloadModelAndWait(m.name, Math.max(3000, Math.floor(maxWaitMs / initialActive.length)), pollIntervalMs);
+  }
+
+  // Verify all are gone
+  const finalActive = await getOllamaActiveModels();
+  const verified = finalActive.length === 0;
+
+  return {
+    success: verified,
+    offloadedCount: initialActive.length - finalActive.length,
+    verified,
+    timeTakenMs: Date.now() - startTime,
+    remainingActiveModels: finalActive,
+  };
+}
+
+// Helper: Ensure only targetModel is in RAM (evict all conflicting models and verify before generation)
+async function ensureOnlyTargetModelLoaded(targetModel, maxWaitMs = 10000) {
+  if (!targetModel) return;
+  try {
+    const active = await getOllamaActiveModels();
+    const conflicting = active.filter(
+      (m) => !matchModelName(m.name, targetModel) && !matchModelName(m.model, targetModel)
+    );
+    if (conflicting.length === 0) return;
+
+    console.log(`[Aria RAM Manager] Found ${conflicting.length} conflicting models in RAM before running "${targetModel}". Offloading to preserve RAM...`);
+    for (const conf of conflicting) {
+      await offloadModelAndWait(conf.name, maxWaitMs);
+    }
+    console.log(`[Aria RAM Manager] Conflicting models verified evicted. RAM is ready for "${targetModel}".`);
+  } catch (err) {
+    console.warn(`[Aria RAM Manager] Auto-eviction note:`, err.message);
+  }
+}
+
+// ==========================================
 // 2. MODEL DISCOVERY ENGINE
 // ==========================================
 // Discovers models from Ollama API, Ollama disk manifests, and HuggingFace cache
@@ -81,6 +243,9 @@ async function discoverInstalledModels() {
   const models = new Map();
   const mem = getSystemMemory();
   const availGB = parseFloat(mem.availableGB);
+
+  // Get active models currently resident in RAM
+  const activeList = await getOllamaActiveModels();
 
   // A. Check running Ollama API
   try {
@@ -97,6 +262,9 @@ async function discoverInstalledModels() {
             safety = 'TIGHT';
           }
 
+          const activeInfo = activeList.find((a) => matchModelName(a.name, m.name) || matchModelName(a.model, m.name));
+          const isLoadedInRam = !!activeInfo;
+
           models.set(m.name, {
             name: m.name,
             source: 'ollama_running',
@@ -109,7 +277,9 @@ async function discoverInstalledModels() {
             capabilities: m.capabilities || ['completion'],
             ramEstimate: ram,
             safetyBadge: safety,
-            isRunning: true,
+            isRunning: isLoadedInRam,
+            isLoadedInRam,
+            loadedDetails: activeInfo || null,
           });
         }
       }
@@ -141,6 +311,9 @@ async function discoverInstalledModels() {
                   safety = 'TIGHT';
                 }
 
+                const activeInfo = activeList.find((a) => matchModelName(a.name, fullName) || matchModelName(a.model, fullName));
+                const isLoadedInRam = !!activeInfo;
+
                 models.set(fullName, {
                   name: fullName,
                   source: 'ollama_disk_manifest',
@@ -153,7 +326,9 @@ async function discoverInstalledModels() {
                   capabilities: ['completion'],
                   ramEstimate: ram,
                   safetyBadge: safety,
-                  isRunning: false,
+                  isRunning: isLoadedInRam,
+                  isLoadedInRam,
+                  loadedDetails: activeInfo || null,
                 });
               } catch (e) {}
             }
@@ -174,7 +349,6 @@ async function discoverInstalledModels() {
           if (!models.has(cleanName)) {
             const fullPath = path.join(hfCacheDir, entry);
             let totalBytes = 0;
-            // approximate size
             try {
               const snapshots = path.join(fullPath, 'snapshots');
               if (fs.existsSync(snapshots)) {
@@ -192,6 +366,9 @@ async function discoverInstalledModels() {
 
             if (totalBytes > 0) {
               const ram = estimateModelRam(totalBytes);
+              const activeInfo = activeList.find((a) => matchModelName(a.name, cleanName) || matchModelName(a.model, cleanName));
+              const isLoadedInRam = !!activeInfo;
+
               models.set(cleanName, {
                 name: cleanName,
                 source: 'huggingface_cache',
@@ -204,13 +381,39 @@ async function discoverInstalledModels() {
                 capabilities: ['completion'],
                 ramEstimate: ram,
                 safetyBadge: ram.totalEstimatedGB > availGB ? 'SWAP_HEAVY' : 'SAFE',
-                isRunning: false,
+                isRunning: isLoadedInRam,
+                isLoadedInRam,
+                loadedDetails: activeInfo || null,
               });
             }
           }
         }
       }
     } catch (e) {}
+  }
+
+  // D. Include any loaded active model not present in disk manifests or tags
+  for (const act of activeList) {
+    const existing = Array.from(models.values()).find((m) => matchModelName(m.name, act.name) || matchModelName(m.name, act.model));
+    if (!existing) {
+      const ram = estimateModelRam(act.sizeBytes, act.details?.parameter_size);
+      models.set(act.name, {
+        name: act.name,
+        source: 'ollama_running',
+        sizeBytes: act.sizeBytes,
+        sizeGB: act.sizeGB,
+        parameterSize: act.details?.parameter_size || 'Unknown',
+        quantization: act.details?.quantization_level || 'Q4',
+        format: act.details?.format || 'gguf',
+        family: act.details?.family || 'unknown',
+        capabilities: ['completion'],
+        ramEstimate: ram,
+        safetyBadge: ram.totalEstimatedGB > availGB ? 'SWAP_HEAVY' : 'SAFE',
+        isRunning: true,
+        isLoadedInRam: true,
+        loadedDetails: act,
+      });
+    }
   }
 
   return Array.from(models.values());
@@ -221,15 +424,116 @@ app.get('/api/system/memory', (req, res) => {
   res.json(getSystemMemory());
 });
 
-// Installed Models API
+// Installed Models API (with active memory tracking)
 app.get('/api/models', async (req, res) => {
   try {
     const list = await discoverInstalledModels();
+    const active = await getOllamaActiveModels();
     res.json({
       models: list,
+      activeModels: active,
       systemMemory: getSystemMemory(),
     });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Live Active Models in RAM API
+app.get('/api/models/active', async (req, res) => {
+  try {
+    const activeModels = await getOllamaActiveModels();
+    const totalBytes = activeModels.reduce((acc, m) => acc + (m.sizeBytes || 0), 0);
+    const totalRamBytes = activeModels.reduce((acc, m) => acc + (m.sizeRamBytes || 0), 0);
+    const totalVramBytes = activeModels.reduce((acc, m) => acc + (m.sizeVramBytes || 0), 0);
+    res.json({
+      activeModels,
+      count: activeModels.length,
+      totalBytes,
+      totalGB: (totalBytes / (1024 * 1024 * 1024)).toFixed(2),
+      totalRamBytes,
+      totalRamGB: (totalRamBytes / (1024 * 1024 * 1024)).toFixed(2),
+      totalVramBytes,
+      totalVramGB: (totalVramBytes / (1024 * 1024 * 1024)).toFixed(2),
+      systemMemory: getSystemMemory(),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Explicit Unload / Offload Endpoint (Verifies removal from RAM)
+app.post('/api/models/unload', async (req, res) => {
+  try {
+    const { model } = req.body;
+    if (!model) {
+      return res.status(400).json({ error: 'Model name is required to offload' });
+    }
+    const result = await offloadModelAndWait(model);
+    res.json({
+      ...result,
+      systemMemory: getSystemMemory(),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Unload All Models Endpoint (Frees all LLM memory from RAM)
+app.post('/api/models/unload-all', async (req, res) => {
+  try {
+    const result = await offloadAllModelsAndWait();
+    res.json({
+      ...result,
+      systemMemory: getSystemMemory(),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Clean Model Switch Endpoint
+// Offloads previous model(s), polls /api/ps until verified gone, then confirms switch
+app.post('/api/models/switch', async (req, res) => {
+  try {
+    const { toModel, fromModel, unloadAllOther = true } = req.body;
+    if (!toModel) {
+      return res.status(400).json({ error: 'Target model (toModel) is required' });
+    }
+
+    console.log(`[Aria RAM Manager] Initiating clean model switch to "${toModel}"...`);
+    const activeBefore = await getOllamaActiveModels();
+    const modelsToOffload = [];
+
+    for (const act of activeBefore) {
+      if (!matchModelName(act.name, toModel) && !matchModelName(act.model, toModel)) {
+        if (unloadAllOther || (fromModel && (matchModelName(act.name, fromModel) || matchModelName(act.model, fromModel)))) {
+          modelsToOffload.push(act.name);
+        }
+      }
+    }
+
+    const offloadResults = [];
+    for (const mName of modelsToOffload) {
+      console.log(`[Aria RAM Manager] Offloading previous model "${mName}" before activating "${toModel}"...`);
+      const offloadRes = await offloadModelAndWait(mName);
+      offloadResults.push(offloadRes);
+    }
+
+    const remainingActive = await getOllamaActiveModels();
+    const verified = !remainingActive.some((m) => modelsToOffload.some((off) => matchModelName(m.name, off)));
+
+    console.log(`[Aria RAM Manager] Clean switch verified for "${toModel}". Remaining active in RAM: ${remainingActive.length}`);
+    res.json({
+      success: true,
+      switchedTo: toModel,
+      offloadedModels: modelsToOffload,
+      verified,
+      activeModels: remainingActive,
+      systemMemory: getSystemMemory(),
+    });
+  } catch (err) {
+    console.error(`[Aria RAM Manager] Error switching models:`, err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -752,6 +1056,10 @@ You MUST respond ONLY with a valid JSON object matching this schema:
   "wayForward": "Actionable explanation of current state and what should be done next to proceed",
   "suggestedNextCommands": ["next_command_1", "next_command_2"]
 }`;
+
+    if (model) {
+      await ensureOnlyTargetModelLoaded(model);
+    }
 
     const auditRes = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
       method: 'POST',
@@ -1886,6 +2194,8 @@ Brief architectural overview and technology stack choice.
 (Repeat for any remaining phases)`;
 
   try {
+    await ensureOnlyTargetModelLoaded(model);
+
     const ollamaRes = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2194,6 +2504,8 @@ The Aria backend will automatically create the files on disk and execute the com
 
     let ollamaRes;
     try {
+      await ensureOnlyTargetModelLoaded(model);
+
       ollamaRes = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

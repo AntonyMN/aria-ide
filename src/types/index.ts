@@ -7,6 +7,34 @@ export interface RamEstimate {
 
 export type SafetyBadge = 'SAFE' | 'TIGHT' | 'SWAP_HEAVY';
 
+export interface LoadedModelDetails {
+  sizeBytes: number;
+  sizeGB: string;
+  sizeVramBytes: number;
+  sizeVramGB: string;
+  sizeRamBytes: number;
+  sizeRamGB: string;
+  ramGB?: string;
+  expiresAt: string;
+  contextLength?: number;
+  details?: Record<string, any>;
+}
+
+export interface ActiveOllamaModel {
+  name: string;
+  model: string;
+  sizeBytes: number;
+  sizeGB: string;
+  sizeVramBytes: number;
+  sizeVramGB: string;
+  sizeRamBytes: number;
+  sizeRamGB: string;
+  ramGB?: string;
+  expiresAt: string;
+  contextLength: number;
+  details?: Record<string, any>;
+}
+
 export interface LocalModel {
   name: string;
   source: 'ollama_running' | 'ollama_disk_manifest' | 'huggingface_cache';
@@ -20,6 +48,8 @@ export interface LocalModel {
   ramEstimate: RamEstimate;
   safetyBadge: SafetyBadge;
   isRunning: boolean;
+  isLoadedInRam?: boolean;
+  loadedDetails?: LoadedModelDetails | null;
 }
 
 export interface SystemMemory {

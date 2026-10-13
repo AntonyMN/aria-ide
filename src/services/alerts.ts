@@ -145,3 +145,19 @@ export function showSuccessToast(message: string): void {
     timerProgressBar: true,
   });
 }
+
+/**
+ * Quick non-blocking informational toast notification
+ */
+export function showInfoToast(message: string): void {
+  darkSwal.fire({
+    toast: true,
+    position: 'top-end',
+    icon: 'info',
+    iconColor: '#00f0ff',
+    title: message,
+    showConfirmButton: false,
+    timer: 2500,
+    timerProgressBar: true,
+  });
+}

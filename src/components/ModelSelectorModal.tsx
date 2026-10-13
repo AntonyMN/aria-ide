@@ -1,6 +1,16 @@
-import React from 'react';
+import React, { useState } from 'react';
 import type { LocalModel, SystemMemory } from '../types';
-import { Cpu, Check, Zap, X } from 'lucide-react';
+import {
+  Cpu,
+  Check,
+  Zap,
+  X,
+  PowerOff,
+  RefreshCw,
+  Search,
+} from 'lucide-react';
+import { unloadModel, unloadAllModels, switchModelClean } from '../services/api';
+import { showSuccessToast, showErrorAlert, showInfoToast } from '../services/alerts';
 
 interface Props {
   isOpen: boolean;
@@ -21,18 +31,142 @@ export const ModelSelectorModal: React.FC<Props> = ({
   systemMemory,
   onRefresh,
 }) => {
+  const [filterTab, setFilterTab] = useState<'all' | 'active'>('all');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [offloadingModel, setOffloadingModel] = useState<string | null>(null);
+  const [isOffloadingAll, setIsOffloadingAll] = useState(false);
+  const [switchingTarget, setSwitchingTarget] = useState<string | null>(null);
+  const [switchStatusMessage, setSwitchStatusMessage] = useState<string>('');
+
   if (!isOpen) return null;
+
+  const activeModelsInRam = models.filter((m) => m.isLoadedInRam);
+  const totalLoadedRamGB = activeModelsInRam
+    .reduce((acc, m) => {
+      const gb = m.loadedDetails?.ramGB ? parseFloat(m.loadedDetails.ramGB) : parseFloat(m.sizeGB);
+      return acc + (isNaN(gb) ? 0 : gb);
+    }, 0)
+    .toFixed(2);
+
+  const filteredModels = models.filter((model) => {
+    if (filterTab === 'active' && !model.isLoadedInRam) return false;
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase();
+      return (
+        model.name.toLowerCase().includes(q) ||
+        model.family.toLowerCase().includes(q) ||
+        model.parameterSize.toLowerCase().includes(q)
+      );
+    }
+    return true;
+  });
+
+  // Handle single model offload
+  const handleOffloadSingle = async (e: React.MouseEvent, modelName: string) => {
+    e.stopPropagation();
+    try {
+      setOffloadingModel(modelName);
+      showInfoToast(`Offloading ${modelName} from RAM...`);
+      const result = await unloadModel(modelName);
+      if (result.verified) {
+        showSuccessToast(`Model ${modelName} successfully offloaded from RAM.`);
+      }
+      onRefresh();
+    } catch (err: any) {
+      console.error('Failed to offload model:', err);
+      showErrorAlert('Offload Failed', err.message || 'Could not offload model from RAM');
+    } finally {
+      setOffloadingModel(null);
+    }
+  };
+
+  // Handle offload all models
+  const handleOffloadAll = async () => {
+    if (activeModelsInRam.length === 0) return;
+    try {
+      setIsOffloadingAll(true);
+      showInfoToast(`Offloading all ${activeModelsInRam.length} models from RAM...`);
+      const result = await unloadAllModels();
+      if (result.verified) {
+        showSuccessToast(`All models offloaded. RAM is completely free.`);
+      }
+      onRefresh();
+    } catch (err: any) {
+      console.error('Failed to offload all models:', err);
+      showErrorAlert('Eject All Failed', err.message || 'Could not offload models');
+    } finally {
+      setIsOffloadingAll(false);
+    }
+  };
+
+  // Handle clean model selection & switch
+  const handleSelectAndSwitch = async (modelName: string) => {
+    if (modelName === selectedModel) {
+      onClose();
+      return;
+    }
+
+    try {
+      setSwitchingTarget(modelName);
+
+      // Check if any other models are currently resident in RAM
+      const otherActive = activeModelsInRam.filter((m) => m.name !== modelName);
+      if (otherActive.length > 0) {
+        const names = otherActive.map((m) => m.name).join(', ');
+        setSwitchStatusMessage(`Offloading ${names} from RAM to prevent memory overlap...`);
+        const result = await switchModelClean(modelName, selectedModel);
+        if (result.verified) {
+          setSwitchStatusMessage(`RAM verified clean. Activating ${modelName}...`);
+          showSuccessToast(`Switched to ${modelName}. Previous models verified offloaded.`);
+        }
+      } else {
+        showSuccessToast(`Active model set to ${modelName}.`);
+      }
+
+      onSelectModel(modelName);
+      onRefresh();
+      setTimeout(() => {
+        onClose();
+      }, 400);
+    } catch (err: any) {
+      console.error('Failed to switch model cleanly:', err);
+      showErrorAlert('Model Switch Failed', err.message || 'Failed to switch model');
+    } finally {
+      setSwitchingTarget(null);
+      setSwitchStatusMessage('');
+    }
+  };
 
   return (
     <div className="modal-overlay" onClick={onClose}>
-      <div className="model-modal" onClick={(e) => e.stopPropagation()}>
+      <div
+        className="model-modal"
+        style={{ width: 760, maxHeight: '90vh' }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Header */}
         <div className="modal-header">
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <Cpu size={20} color="var(--accent-cyan)" />
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <div
+              style={{
+                width: 34,
+                height: 34,
+                borderRadius: 8,
+                background: 'rgba(0, 240, 255, 0.1)',
+                border: '1px solid rgba(0, 240, 255, 0.3)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+              }}
+            >
+              <Cpu size={20} color="var(--accent-cyan)" />
+            </div>
             <div>
-              <h2 style={{ fontSize: 16, fontWeight: 700 }}>Installed Local LLMs & RAM Cost</h2>
-              <p style={{ fontSize: 12, color: 'var(--text-dim)' }}>
-                Scanned from your computer (Ollama manifests & running daemon).
+              <h2 style={{ fontSize: 16, fontWeight: 700, margin: 0, color: '#fff' }}>
+                Local LLM Manager & RAM Conservator
+              </h2>
+              <p style={{ fontSize: 12, color: 'var(--text-dim)', margin: '2px 0 0' }}>
+                Track resident memory footprints, offload idle models, and switch cleanly without RAM spikes.
               </p>
             </div>
           </div>
@@ -41,127 +175,379 @@ export const ModelSelectorModal: React.FC<Props> = ({
           </button>
         </div>
 
-        {/* Hardware Memory Status Banner */}
+        {/* Hardware & Active Memory Status Bar */}
         {systemMemory && (
-          <div style={{
-            padding: '12px 20px',
-            background: 'rgba(0, 0, 0, 0.25)',
-            borderBottom: '1px solid var(--border-color)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            fontSize: 12
-          }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+          <div
+            style={{
+              padding: '12px 20px',
+              background: 'rgba(0, 0, 0, 0.35)',
+              borderBottom: '1px solid var(--border-color)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              fontSize: 12,
+              flexWrap: 'wrap',
+              gap: 12,
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
               <div>
                 <span style={{ color: 'var(--text-dim)' }}>Total RAM: </span>
                 <strong style={{ color: 'var(--text-main)' }}>{systemMemory.totalGB} GB</strong>
               </div>
               <div>
                 <span style={{ color: 'var(--text-dim)' }}>Used: </span>
-                <strong style={{ color: 'var(--text-main)' }}>{systemMemory.usedGB} GB ({systemMemory.usedPercent}%)</strong>
+                <strong style={{ color: 'var(--text-main)' }}>
+                  {systemMemory.usedGB} GB ({systemMemory.usedPercent}%)
+                </strong>
               </div>
               <div>
-                <span style={{ color: 'var(--text-dim)' }}>Available for LLM: </span>
-                <strong style={{ color: 'var(--accent-emerald)' }}>{systemMemory.availableGB} GB</strong>
+                <span style={{ color: 'var(--text-dim)' }}>Free for LLM: </span>
+                <strong style={{ color: 'var(--accent-emerald)' }}>
+                  {systemMemory.availableGB} GB
+                </strong>
               </div>
+              {activeModelsInRam.length > 0 && (
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 6,
+                    background: 'rgba(16, 185, 129, 0.15)',
+                    padding: '2px 8px',
+                    borderRadius: 6,
+                    border: '1px solid rgba(16, 185, 129, 0.3)',
+                  }}
+                >
+                  <span className="pulsing-green-dot" />
+                  <span style={{ color: '#10b981', fontWeight: 600 }}>
+                    In RAM: {totalLoadedRamGB} GB ({activeModelsInRam.length} model
+                    {activeModelsInRam.length > 1 ? 's' : ''})
+                  </span>
+                </div>
+              )}
             </div>
-            <button className="icon-btn" style={{ fontSize: 11, padding: '4px 8px' }} onClick={onRefresh}>
-              Refresh Hardware
-            </button>
+
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              {activeModelsInRam.length > 0 && (
+                <button
+                  className="btn-offload-ram"
+                  onClick={handleOffloadAll}
+                  disabled={isOffloadingAll}
+                  title="Unload all active models to free RAM"
+                >
+                  <PowerOff size={13} />
+                  <span>{isOffloadingAll ? 'Offloading All...' : 'Offload All RAM'}</span>
+                </button>
+              )}
+              <button
+                className="icon-btn"
+                style={{ fontSize: 11, padding: '5px 10px', display: 'flex', alignItems: 'center', gap: 6 }}
+                onClick={onRefresh}
+                title="Refresh hardware and scanning engine"
+              >
+                <RefreshCw size={12} />
+                <span>Refresh</span>
+              </button>
+            </div>
           </div>
         )}
 
-        <div className="modal-content">
-          {models.length === 0 ? (
+        {/* Switching / Offloading In-Progress Banner */}
+        {switchingTarget && (
+          <div
+            style={{
+              padding: '10px 20px',
+              background: 'linear-gradient(90deg, rgba(0, 240, 255, 0.15), rgba(168, 85, 247, 0.15))',
+              borderBottom: '1px solid rgba(0, 240, 255, 0.3)',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 12,
+              fontSize: 12,
+              color: 'var(--accent-cyan)',
+            }}
+          >
+            <RefreshCw size={16} className="spin-animation" style={{ animation: 'spin 1s linear infinite' }} />
+            <div>
+              <strong>Safely Switching Model:</strong> {switchStatusMessage || `Preparing ${switchingTarget}...`}
+            </div>
+          </div>
+        )}
+
+        {/* Search & Tabs Toolbar */}
+        <div
+          style={{
+            padding: '10px 20px',
+            borderBottom: '1px solid var(--border-color)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: 12,
+            background: 'rgba(255, 255, 255, 0.02)',
+          }}
+        >
+          {/* Tabs */}
+          <div style={{ display: 'flex', gap: 6 }}>
+            <button
+              onClick={() => setFilterTab('all')}
+              style={{
+                background: filterTab === 'all' ? 'rgba(255, 255, 255, 0.1)' : 'transparent',
+                color: filterTab === 'all' ? '#fff' : 'var(--text-dim)',
+                border: '1px solid',
+                borderColor: filterTab === 'all' ? 'var(--border-color)' : 'transparent',
+                borderRadius: 6,
+                padding: '4px 12px',
+                fontSize: 12,
+                cursor: 'pointer',
+                fontWeight: 600,
+              }}
+            >
+              All Models ({models.length})
+            </button>
+            <button
+              onClick={() => setFilterTab('active')}
+              style={{
+                background: filterTab === 'active' ? 'rgba(16, 185, 129, 0.15)' : 'transparent',
+                color: filterTab === 'active' ? '#10b981' : 'var(--text-dim)',
+                border: '1px solid',
+                borderColor: filterTab === 'active' ? 'rgba(16, 185, 129, 0.4)' : 'transparent',
+                borderRadius: 6,
+                padding: '4px 12px',
+                fontSize: 12,
+                cursor: 'pointer',
+                fontWeight: 600,
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+              }}
+            >
+              {activeModelsInRam.length > 0 && <span className="pulsing-green-dot" />}
+              <span>Loaded in RAM ({activeModelsInRam.length})</span>
+            </button>
+          </div>
+
+          {/* Search box */}
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              background: 'rgba(0, 0, 0, 0.3)',
+              border: '1px solid var(--border-color)',
+              borderRadius: 6,
+              padding: '4px 10px',
+              width: 220,
+            }}
+          >
+            <Search size={14} color="var(--text-dim)" />
+            <input
+              type="text"
+              placeholder="Search model or family..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              style={{
+                background: 'transparent',
+                border: 'none',
+                color: '#fff',
+                fontSize: 12,
+                outline: 'none',
+                width: '100%',
+              }}
+            />
+          </div>
+        </div>
+
+        {/* Models List */}
+        <div className="modal-content" style={{ maxHeight: 'calc(90vh - 180px)' }}>
+          {filteredModels.length === 0 ? (
             <div style={{ padding: 40, textAlign: 'center', color: 'var(--text-dim)' }}>
-              No installed models detected yet. Make sure Ollama has downloaded models (e.g. <code>ollama pull qwen2.5-coder:1.5b</code>).
+              {filterTab === 'active' ? (
+                <div>
+                  <div style={{ fontSize: 24, marginBottom: 8 }}>💤</div>
+                  <strong style={{ color: '#fff', fontSize: 14 }}>RAM is completely clean!</strong>
+                  <p style={{ fontSize: 12, marginTop: 4 }}>
+                    No Ollama models are resident in memory. System RAM is fully preserved.
+                  </p>
+                </div>
+              ) : (
+                <div>
+                  <p>No models found matching your search.</p>
+                  <p style={{ fontSize: 12 }}>
+                    Make sure models are downloaded with <code>ollama pull &lt;model&gt;</code>.
+                  </p>
+                </div>
+              )}
             </div>
           ) : (
-            models.map((model) => {
+            filteredModels.map((model) => {
               const isSelected = model.name === selectedModel;
+              const isLoaded = !!model.isLoadedInRam;
+              const isBusyOffloading = offloadingModel === model.name;
+              const isTargetOfSwitch = switchingTarget === model.name;
               const ram = model.ramEstimate;
+              const loadedRamGB = model.loadedDetails?.ramGB || model.sizeGB;
 
               return (
                 <div
                   key={model.name}
-                  className={`model-card ${isSelected ? 'selected' : ''}`}
-                  onClick={() => {
-                    onSelectModel(model.name);
-                    onClose();
-                  }}
+                  className={`model-card ${isSelected ? 'selected' : ''} ${isLoaded ? 'loaded-in-ram' : ''}`}
+                  onClick={() => handleSelectAndSwitch(model.name)}
                 >
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 6, flex: 1 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                      <span style={{ fontSize: 14, fontWeight: 600, color: '#fff' }}>{model.name}</span>
+                    {/* Header Row */}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                      <span style={{ fontSize: 14, fontWeight: 700, color: '#fff' }}>
+                        {model.name}
+                      </span>
+
+                      {/* Active Selection Badge */}
                       {isSelected && (
-                        <span style={{
-                          fontSize: 10,
-                          background: 'rgba(0, 240, 255, 0.2)',
-                          color: 'var(--accent-cyan)',
-                          padding: '2px 6px',
-                          borderRadius: 4,
-                          fontWeight: 600
-                        }}>ACTIVE</span>
+                        <span
+                          style={{
+                            fontSize: 10,
+                            background: 'rgba(0, 240, 255, 0.2)',
+                            color: 'var(--accent-cyan)',
+                            border: '1px solid rgba(0, 240, 255, 0.4)',
+                            padding: '2px 6px',
+                            borderRadius: 4,
+                            fontWeight: 700,
+                          }}
+                        >
+                          ACTIVE TARGET
+                        </span>
                       )}
-                      <span className={`badge ${
-                        model.safetyBadge === 'SAFE'
-                          ? 'badge-safe'
-                          : model.safetyBadge === 'TIGHT'
-                          ? 'badge-tight'
-                          : 'badge-heavy'
-                      }`}>
+
+                      {/* Loaded in RAM Status Badge */}
+                      {isLoaded ? (
+                        <span className="badge badge-ram-active">
+                          <span className="pulsing-green-dot" />
+                          <span>LOADED IN RAM ({loadedRamGB} GB)</span>
+                        </span>
+                      ) : (
+                        <span className="badge badge-dormant">
+                          <span>DORMANT ON DISK</span>
+                        </span>
+                      )}
+
+                      {/* Safety Badge */}
+                      <span
+                        className={`badge ${
+                          model.safetyBadge === 'SAFE'
+                            ? 'badge-safe'
+                            : model.safetyBadge === 'TIGHT'
+                            ? 'badge-tight'
+                            : 'badge-heavy'
+                        }`}
+                      >
                         {model.safetyBadge === 'SAFE' && '🟢 Safe & Fast'}
-                        {model.safetyBadge === 'TIGHT' && '🟡 Fits (Tight RAM)'}
+                        {model.safetyBadge === 'TIGHT' && '🟡 Tight RAM'}
                         {model.safetyBadge === 'SWAP_HEAVY' && '🔴 High Swap Risk'}
                       </span>
                     </div>
 
-                    <div style={{ display: 'flex', gap: 16, fontSize: 12, color: 'var(--text-dim)' }}>
-                      <span>Parameters: <strong>{model.parameterSize}</strong></span>
-                      <span>Quant: <strong>{model.quantization}</strong></span>
-                      <span>Disk: <strong>{model.sizeGB} GB</strong></span>
-                      <span>Source: <strong>{model.source.replace('_', ' ')}</strong></span>
+                    {/* Metadata specs */}
+                    <div
+                      style={{
+                        display: 'flex',
+                        gap: 16,
+                        fontSize: 12,
+                        color: 'var(--text-dim)',
+                        flexWrap: 'wrap',
+                      }}
+                    >
+                      <span>
+                        Parameters: <strong style={{ color: 'var(--text-main)' }}>{model.parameterSize}</strong>
+                      </span>
+                      <span>
+                        Quant: <strong style={{ color: 'var(--text-main)' }}>{model.quantization}</strong>
+                      </span>
+                      <span>
+                        Disk Size: <strong style={{ color: 'var(--text-main)' }}>{model.sizeGB} GB</strong>
+                      </span>
+                      <span>
+                        Format: <strong style={{ color: 'var(--text-main)' }}>{model.format}</strong>
+                      </span>
+                      {model.loadedDetails?.expiresAt && (
+                        <span title={model.loadedDetails.expiresAt}>
+                          Keep-alive: <strong style={{ color: '#10b981' }}>Resident</strong>
+                        </span>
+                      )}
                     </div>
 
                     {/* RAM breakdown */}
-                    <div style={{
-                      display: 'flex',
-                      gap: 12,
-                      marginTop: 4,
-                      fontSize: 11,
-                      fontFamily: 'var(--font-mono)',
-                      background: 'rgba(0, 0, 0, 0.2)',
-                      padding: '4px 8px',
-                      borderRadius: 6,
-                      width: 'fit-content'
-                    }}>
+                    <div
+                      style={{
+                        display: 'flex',
+                        gap: 12,
+                        marginTop: 4,
+                        fontSize: 11,
+                        fontFamily: 'var(--font-mono)',
+                        background: 'rgba(0, 0, 0, 0.25)',
+                        padding: '4px 10px',
+                        borderRadius: 6,
+                        width: 'fit-content',
+                      }}
+                    >
                       <span style={{ color: 'var(--text-muted)' }}>
-                        Est. RAM: <strong style={{ color: 'var(--accent-cyan)' }}>{ram.totalEstimatedGB} GB</strong>
+                        Est. RAM:{' '}
+                        <strong style={{ color: isLoaded ? '#10b981' : 'var(--accent-cyan)' }}>
+                          {ram.totalEstimatedGB} GB
+                        </strong>
                       </span>
                       <span style={{ color: 'var(--text-dim)' }}>
-                        (Weights: {ram.weightsGB} GB + KV Cache: {ram.kvCacheGB} GB)
+                        (Weights: {ram.weightsGB} GB + KV Cache: {ram.kvCacheGB} GB + Buffer: {ram.runtimeBufferGB} GB)
                       </span>
                     </div>
                   </div>
 
+                  {/* Actions Column */}
                   <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                    {/* Offload from RAM Button */}
+                    {isLoaded && (
+                      <button
+                        className="btn-offload-ram"
+                        disabled={isBusyOffloading || isTargetOfSwitch}
+                        onClick={(e) => handleOffloadSingle(e, model.name)}
+                        title="Unload this model from RAM to reclaim system memory"
+                      >
+                        <PowerOff size={13} />
+                        <span>{isBusyOffloading ? 'Offloading...' : 'Offload RAM'}</span>
+                      </button>
+                    )}
+
+                    {/* Select / Switch Button */}
                     <button
                       className="send-btn"
+                      disabled={isTargetOfSwitch}
                       style={{
                         padding: '6px 14px',
-                        background: isSelected ? 'rgba(0, 240, 255, 0.2)' : 'rgba(255, 255, 255, 0.08)',
+                        background: isSelected
+                          ? 'rgba(0, 240, 255, 0.2)'
+                          : 'rgba(255, 255, 255, 0.08)',
                         color: isSelected ? 'var(--accent-cyan)' : '#fff',
-                        border: isSelected ? '1px solid var(--accent-cyan)' : '1px solid var(--border-color)',
+                        border: isSelected
+                          ? '1px solid var(--accent-cyan)'
+                          : '1px solid var(--border-color)',
                       }}
                       onClick={(e) => {
                         e.stopPropagation();
-                        onSelectModel(model.name);
-                        onClose();
+                        handleSelectAndSwitch(model.name);
                       }}
                     >
-                      {isSelected ? <Check size={14} /> : <Zap size={14} />}
-                      {isSelected ? 'Selected' : 'Use Model'}
+                      {isTargetOfSwitch ? (
+                        <RefreshCw size={14} style={{ animation: 'spin 1s linear infinite' }} />
+                      ) : isSelected ? (
+                        <Check size={14} />
+                      ) : (
+                        <Zap size={14} />
+                      )}
+                      <span>
+                        {isTargetOfSwitch
+                          ? 'Switching...'
+                          : isSelected
+                          ? 'Selected'
+                          : 'Use Model'}
+                      </span>
                     </button>
                   </div>
                 </div>

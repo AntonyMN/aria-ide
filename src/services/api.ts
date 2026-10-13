@@ -1,4 +1,14 @@
-import type { LocalModel, SystemMemory, FileNode, ExecutionPhase, PlanTask, WorkspaceSession, ActivityLogItem, CommandAuditResult } from '../types';
+import type {
+  LocalModel,
+  SystemMemory,
+  FileNode,
+  ExecutionPhase,
+  PlanTask,
+  WorkspaceSession,
+  ActivityLogItem,
+  CommandAuditResult,
+  ActiveOllamaModel,
+} from '../types';
 
 const API_BASE = 'http://localhost:3001/api';
 
@@ -8,9 +18,91 @@ export async function fetchSystemMemory(): Promise<SystemMemory> {
   return res.json();
 }
 
-export async function fetchModels(): Promise<{ models: LocalModel[]; systemMemory: SystemMemory }> {
+export async function fetchModels(): Promise<{
+  models: LocalModel[];
+  activeModels?: ActiveOllamaModel[];
+  systemMemory: SystemMemory;
+}> {
   const res = await fetch(`${API_BASE}/models`);
   if (!res.ok) throw new Error('Failed to fetch models');
+  return res.json();
+}
+
+export async function fetchActiveModels(): Promise<{
+  activeModels: ActiveOllamaModel[];
+  count: number;
+  totalGB: string;
+  totalRamGB: string;
+  totalVramGB: string;
+  systemMemory: SystemMemory;
+}> {
+  const res = await fetch(`${API_BASE}/models/active`);
+  if (!res.ok) throw new Error('Failed to fetch active models');
+  return res.json();
+}
+
+export async function unloadModel(model: string): Promise<{
+  success: boolean;
+  model: string;
+  offloaded: boolean;
+  verified: boolean;
+  timeTakenMs: number;
+  remainingActiveModels: ActiveOllamaModel[];
+  systemMemory: SystemMemory;
+}> {
+  const res = await fetch(`${API_BASE}/models/unload`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: 'Failed to offload model' }));
+    throw new Error(err.error || 'Failed to offload model');
+  }
+  return res.json();
+}
+
+export async function unloadAllModels(): Promise<{
+  success: boolean;
+  offloadedCount: number;
+  verified: boolean;
+  timeTakenMs: number;
+  remainingActiveModels: ActiveOllamaModel[];
+  systemMemory: SystemMemory;
+}> {
+  const res = await fetch(`${API_BASE}/models/unload-all`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({}),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: 'Failed to offload all models' }));
+    throw new Error(err.error || 'Failed to offload all models');
+  }
+  return res.json();
+}
+
+export async function switchModelClean(
+  toModel: string,
+  fromModel?: string,
+  unloadAllOther = true
+): Promise<{
+  success: boolean;
+  switchedTo: string;
+  offloadedModels: string[];
+  verified: boolean;
+  activeModels: ActiveOllamaModel[];
+  systemMemory: SystemMemory;
+}> {
+  const res = await fetch(`${API_BASE}/models/switch`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ toModel, fromModel, unloadAllOther }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: 'Failed to switch model' }));
+    throw new Error(err.error || 'Failed to switch model');
+  }
   return res.json();
 }
 

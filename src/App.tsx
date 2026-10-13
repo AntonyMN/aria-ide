@@ -27,6 +27,9 @@ import {
   saveWorkspaceSession,
   interruptAgent,
   streamSequentialCommandsLive,
+  fetchActiveModels,
+  unloadAllModels,
+  switchModelClean,
 } from './services/api';
 import { FileTree } from './components/FileTree';
 import { ModelSelectorModal } from './components/ModelSelectorModal';
@@ -43,6 +46,7 @@ import {
   showErrorAlert,
   showWarningAlert,
   showSuccessToast,
+  showInfoToast,
 } from './services/alerts';
 import {
   Cpu,
@@ -53,6 +57,7 @@ import {
   X,
   Code2,
   Zap,
+  PowerOff,
 } from 'lucide-react';
 
 export function App() {
@@ -220,14 +225,56 @@ export function App() {
       setModels(data.models);
       setSystemMemory(data.systemMemory);
 
-      // Auto-select safest model if none selected yet
+      // Auto-select model if none selected yet: prefer model already loaded in RAM, then safe model
       if (!selectedModel && data.models.length > 0) {
-        // Prefer a safe model like qwen2.5-coder:1.5b or first available
+        const loaded = data.models.find((m) => m.isLoadedInRam);
         const safe = data.models.find((m) => m.safetyBadge === 'SAFE') || data.models[0];
-        setSelectedModel(safe.name);
+        setSelectedModel(loaded ? loaded.name : safe.name);
       }
     } catch (err) {
       console.error('Failed to discover models:', err);
+    }
+  };
+
+  // Safe Model Switching: Verifies previous models are offloaded from RAM before activating new model
+  const handleSwitchModel = async (newModel: string) => {
+    if (newModel === selectedModel) return;
+    try {
+      const activeRes = await fetchActiveModels();
+      const otherActive = activeRes.activeModels.filter((m) => m.name !== newModel);
+
+      if (otherActive.length > 0) {
+        const otherNames = otherActive.map((m) => m.name).join(', ');
+        showInfoToast(`Offloading previous model (${otherNames}) from RAM...`);
+        const res = await switchModelClean(newModel, selectedModel);
+        if (res.verified) {
+          showSuccessToast(`RAM cleared! Active model is now ${newModel}.`);
+        }
+      } else {
+        showSuccessToast(`Active model is now ${newModel}.`);
+      }
+
+      setSelectedModel(newModel);
+      await loadModelsAndHardware();
+    } catch (err: any) {
+      console.error('Failed to switch model cleanly:', err);
+      showErrorAlert('Model Switch Failed', err.message || 'Could not cleanly switch models');
+    }
+  };
+
+  // Quick Offload All models from RAM
+  const handleQuickOffloadAll = async (e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    try {
+      showInfoToast('Reclaiming RAM: offloading resident models from memory...');
+      const res = await unloadAllModels();
+      if (res.verified) {
+        showSuccessToast('All models offloaded. RAM is fully preserved.');
+      }
+      await loadModelsAndHardware();
+    } catch (err: any) {
+      console.error('Failed to offload models:', err);
+      showErrorAlert('Offload Failed', err.message || 'Could not offload models from RAM');
     }
   };
 
@@ -1400,6 +1447,13 @@ Output ONLY the file code inside:
 
   const activeTab = tabs.find((t) => t.id === activeTabId);
   const activeModelObj = models.find((m) => m.name === selectedModel);
+  const activeLoadedModels = models.filter((m) => m.isLoadedInRam);
+  const totalLoadedRamGB = activeLoadedModels
+    .reduce((acc, m) => {
+      const gb = m.loadedDetails?.ramGB ? parseFloat(m.loadedDetails.ramGB) : parseFloat(m.sizeGB);
+      return acc + (isNaN(gb) ? 0 : gb);
+    }, 0)
+    .toFixed(2);
 
   return (
     <div className="ide-container">
@@ -1433,6 +1487,44 @@ Output ONLY the file code inside:
               </span>
             )}
           </button>
+
+          {/* Quick Active RAM Indicator & Offload */}
+          {activeLoadedModels.length > 0 && (
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+                background: 'rgba(16, 185, 129, 0.12)',
+                border: '1px solid rgba(16, 185, 129, 0.4)',
+                borderRadius: 8,
+                padding: '4px 10px',
+                fontSize: 11,
+                color: '#10b981',
+              }}
+              title={`${activeLoadedModels.length} model(s) resident in RAM (${totalLoadedRamGB} GB). Click to offload and free memory.`}
+            >
+              <span className="pulsing-green-dot" />
+              <span>In RAM: <strong>{totalLoadedRamGB} GB</strong></span>
+              <button
+                onClick={handleQuickOffloadAll}
+                style={{
+                  background: 'transparent',
+                  border: 'none',
+                  color: '#f87171',
+                  cursor: 'pointer',
+                  padding: '2px 4px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  marginLeft: 2,
+                  borderRadius: 4,
+                }}
+                title="Offload all models from RAM to free system memory"
+              >
+                <PowerOff size={12} />
+              </button>
+            </div>
+          )}
         </div>
 
         {/* Workspace Path Breadcrumb */}
@@ -1719,6 +1811,41 @@ Output ONLY the file code inside:
           </span>
           <span>Model: <strong>{selectedModel}</strong></span>
           {activeModelObj && <span>Est. RAM: <strong>{activeModelObj.ramEstimate.totalEstimatedGB} GB</strong></span>}
+          {activeModelObj?.isLoadedInRam && (
+            <span
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 5,
+                color: '#10b981',
+                background: 'rgba(16, 185, 129, 0.1)',
+                padding: '1px 6px',
+                borderRadius: 4,
+                border: '1px solid rgba(16, 185, 129, 0.3)',
+              }}
+            >
+              <span className="pulsing-green-dot" style={{ width: 6, height: 6 }} />
+              <span>Resident in RAM ({activeModelObj.loadedDetails?.ramGB || activeModelObj.sizeGB} GB)</span>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleQuickOffloadAll();
+                }}
+                style={{
+                  background: 'transparent',
+                  border: 'none',
+                  color: '#f87171',
+                  cursor: 'pointer',
+                  padding: '0 2px',
+                  display: 'flex',
+                  alignItems: 'center',
+                }}
+                title="Offload from RAM"
+              >
+                <PowerOff size={11} />
+              </button>
+            </span>
+          )}
           <span style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--accent-cyan)' }}>
             <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--accent-cyan)' }}></span>
             <span>Session Synced (.ide)</span>
@@ -1737,7 +1864,7 @@ Output ONLY the file code inside:
         onClose={() => setIsModelModalOpen(false)}
         models={models}
         selectedModel={selectedModel}
-        onSelectModel={(name) => setSelectedModel(name)}
+        onSelectModel={handleSwitchModel}
         systemMemory={systemMemory}
         onRefresh={loadModelsAndHardware}
       />

@@ -3174,7 +3174,34 @@ app.post('/api/agent/stream', async (req, res) => {
       } catch (e) {}
     }
 
-    // 1. Context from .ide/context.md
+    // 1. Dedicated Implementation Plan Inspection
+    let planSnippet = '';
+    const planPath = path.join(targetWorkspace, 'IMPLEMENTATION_PLAN.md');
+    if (fs.existsSync(planPath)) {
+      try {
+        const planText = fs.readFileSync(planPath, 'utf8');
+        planSnippet = `\n======================================================================
+ACTIVE IMPLEMENTATION PLAN (IMPLEMENTATION_PLAN.md):
+${planText.slice(0, 5000)}
+======================================================================\n`;
+      } catch (e) {}
+    }
+
+    // 2. Recent Activity & Failed Commands from .ide/activity.json
+    let recentActivitySnippet = '';
+    const actFile = path.join(targetWorkspace, '.ide', 'activity.json');
+    if (fs.existsSync(actFile)) {
+      try {
+        const activities = JSON.parse(fs.readFileSync(actFile, 'utf8'));
+        const lastFew = activities.slice(-6);
+        if (lastFew.length > 0) {
+          recentActivitySnippet = `\nRECENT COMMANDS & WORKSPACE ACTIONS:
+${lastFew.map((a) => `- [${a.type}] ${a.command || a.path || ''} (Success: ${a.success ?? 'N/A'}${a.exitCode !== undefined ? `, Exit: ${a.exitCode}` : ''}${a.auditSummary ? ` | ${a.auditSummary}` : ''})`).join('\n')}\n`;
+        }
+      } catch (e) {}
+    }
+
+    // 3. Context from .ide/context.md
     let ideContextSnippet = '';
     const ideContextPath = path.join(targetWorkspace, '.ide', 'context.md');
     if (fs.existsSync(ideContextPath)) {
@@ -3184,7 +3211,7 @@ app.post('/api/agent/stream', async (req, res) => {
       } catch (e) {}
     }
 
-    // 2. Direct File System Inspection: Top-level workspace code files
+    // 4. Direct File System Inspection: Top-level workspace code files
     let existingFilesSnippet = '';
     try {
       const topEntries = fs.readdirSync(targetWorkspace, { withFileTypes: true });
@@ -3206,7 +3233,7 @@ app.post('/api/agent/stream', async (req, res) => {
       }
     } catch (e) {}
 
-    // 3. Active Monaco Editor File (if provided)
+    // 5. Active Monaco Editor File (if provided)
     let activeFileSnippet = '';
     if (activeFile && activeFile.path && activeFile.content) {
       activeFileSnippet = `\nCURRENTLY ACTIVE OPEN FILE IN MONACO EDITOR:
@@ -3217,7 +3244,7 @@ ${activeFile.content.slice(0, 10000)}
 \`\`\`\n`;
     }
 
-    // 4. Active Working Directory & Current Folder Contents
+    // 6. Active Working Directory & Current Folder Contents
     const activeWorkingDir = currentCwd || (workspaceCwdMap.get(targetWorkspace) || targetWorkspace);
     let activeCwdSnippet = '';
     try {
@@ -3230,27 +3257,26 @@ ITEMS ALREADY IN THIS ACTIVE FOLDER:
       }
     } catch (e) {}
 
-    let systemInstruction = `You are the Autonomous Software Engineer of the Aria IDE.
-You are running directly on Linux Ubuntu with full access to the project workspace at:
+    let systemInstruction = `You are the Autonomous Software Engineer of Aria IDE.
+You are running directly on Linux Ubuntu with DIRECT, ACTIVE ACCESS to the workspace at:
 ${targetWorkspace}
 
+WORKSPACE ENVIRONMENT & ACTIVE PLAN:
+${planSnippet || '(No IMPLEMENTATION_PLAN.md found on disk)'}
 Workspace Files:
 ${fileListSnippet || '(Empty workspace)'}
 ${manifestInfo}
+${recentActivitySnippet}
 ${ideContextSnippet}
 ${existingFilesSnippet}
 ${activeFileSnippet}
 ${activeCwdSnippet}
 
 CRITICAL OPERATIONAL RULES:
-1. MANDATORY FOLDER INSPECTION: Whenever you deal with ANY command or task, ALWAYS check what is already in the folder first.
-   - Inspect the items listed above under "ITEMS ALREADY IN THIS ACTIVE FOLDER".
-   - Find out what has already been done (e.g. project scaffolding created, dependencies installed, configuration files in place, source code written).
-   - NEVER re-run scaffolding (e.g. "laravel new", "create-vite", "npm init", "cargo new") if the project or folder is already initialized!
-   - Find out what has been done and proceed strictly from that current state.
-2. NEVER instruct the user to run commands or build files manually.
-3. Provide real, complete code without placeholders or omissions.
-4. You have full access to inspect, modify, and build workspace files.
+1. NEVER CLAIM YOU LACK ACCESS: You are NOT an isolated web chatbot. You are the embedded core engine of Aria IDE. You ALREADY have direct access to the workspace directory, files, and implementation plan provided above. NEVER apologize or say "as an AI language model, I do not have access to the folder or files".
+2. RECOVERING SITUATIONS & PROCEEDING: If the user asks to recover a situation, check what has been done, or consult the implementation plan, inspect the ACTIVE IMPLEMENTATION PLAN, RECENT ACTIONS, and ITEMS ALREADY IN THIS ACTIVE FOLDER above. Diagnose what failed or succeeded, and immediately provide the exact fix, command, or file updates.
+3. MANDATORY FOLDER INSPECTION: Examine what is already in the folder before taking action. Never re-initialize scaffolding (e.g., "laravel new", "composer create-project", "npm init") if already initialized!
+4. Provide real, complete code without placeholders or omissions.
 5. When writing code, use explicit blocks:
 \`\`\`file:relative/path/to/file.ext
 [complete code here]
@@ -3265,17 +3291,23 @@ The Aria backend will automatically create the files on disk and execute the com
       systemInstruction += `\nInclude deep reasoning steps inside <think>...</think> tags before writing your answer.`;
     }
 
-    // Smart context pruning: keeps last 4 messages and compresses massive code blocks
+    // Smart context pruning: sanitizes generic AI boilerplate and compresses large code blocks
     const prunedMessages = [{ role: 'system', content: systemInstruction }];
     const recentHistory = (conversationHistory || []).slice(-4);
     for (const msg of recentHistory) {
       let content = msg.content || '';
+      // Strip generic canned AI disclaimers so small models don't mimic them
+      content = content.replace(/I apologize, but as an AI language model[^\n]*/gi, '');
+      content = content.replace(/as an AI language model, I do not have access[^\n]*/gi, '');
+      content = content.replace(/Please provide me with the implementation plan document[^\n]*/gi, '');
       if (content.length > 2000) {
         content = content.replace(/```(?:file:[^\n]+|[\w]+)?\n([\s\S]{250,}?)```/g, () => {
           return '```\n[Code block omitted: file already synced to disk]\n```';
         });
       }
-      prunedMessages.push({ role: msg.role, content });
+      if (content.trim()) {
+        prunedMessages.push({ role: msg.role, content: content.trim() });
+      }
     }
     prunedMessages.push({ role: 'user', content: prompt });
 

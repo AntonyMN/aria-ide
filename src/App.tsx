@@ -984,8 +984,10 @@ export function App() {
         autoApplyFiles: options.autoApplyFiles ?? true,
         autoExecuteCommands: options.autoExecuteCommands ?? true,
         targetFiles: options.targetFiles || [],
-        expectedCommands: options.expectedCommands || [],
-        activeFile: activeTab ? { path: activeTab.path, content: activeTab.content } : undefined,
+        activeFile: (() => {
+          const tab = tabs.find((t) => t.id === activeTabId);
+          return tab ? { path: tab.path, content: tab.content } : undefined;
+        })(),
         openTabs: tabs.map((t) => ({ path: t.path, name: t.name })),
         conversationHistory: messages.map((m) => ({
           role: m.role,

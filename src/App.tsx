@@ -941,6 +941,7 @@ export function App() {
         model: selectedModel,
         prompt: targetPrompt,
         workspacePath,
+        currentCwd,
         thinkingEnabled: options.thinkingEnabled,
         autoApplyFiles: options.autoApplyFiles ?? true,
         autoExecuteCommands: options.autoExecuteCommands ?? true,
@@ -999,6 +1000,27 @@ export function App() {
               })
             );
           } catch (e) {}
+        } else if (eventType === 'error' && dataStr) {
+          try {
+            const errData = JSON.parse(dataStr);
+            const errMsg = errData.error || 'Execution error from local LLM stream';
+            console.error('Agent stream error event:', errMsg);
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === targetMsgId
+                  ? {
+                      ...m,
+                      content: (m.content ? m.content + '\n\n' : '') + `❌ **Error:** ${errMsg}`,
+                      isStreaming: false,
+                    }
+                  : m
+              )
+            );
+            showErrorAlert('Agent Execution Error', errMsg);
+            throw new Error(errMsg);
+          } catch (e: any) {
+            throw e;
+          }
         } else if (eventType === 'file_written' && dataStr) {
           try {
             const f = JSON.parse(dataStr);
@@ -1277,6 +1299,9 @@ Output ONLY the file code inside:
       );
 
       const isLastPhase = phaseIndex === plan.phases.length - 1;
+      const filesCount = phaseResult.writtenFiles.length;
+      const cmdsCount = phaseResult.executedCommands.length;
+      const hadMissingTargets = phase.targetFiles.length > 0 && filesCount === 0;
 
       setMessages((prev) =>
         prev.map((m) =>
@@ -1285,7 +1310,9 @@ Output ONLY the file code inside:
                 ...m,
                 content:
                   m.content +
-                  `\n\n✅ **Phase ${phase.number} Complete!** (${phaseResult.writtenFiles.length} files written, ${phaseResult.executedCommands.length} commands run)` +
+                  (hadMissingTargets
+                    ? `\n\n⚠️ **Phase ${phase.number} Completed with Warnings:** (0 files written for planned targets: ${phase.targetFiles.join(', ')}, ${cmdsCount} commands run)`
+                    : `\n\n✅ **Phase ${phase.number} Complete!** (${filesCount} files written, ${cmdsCount} commands run)`) +
                   (isLastPhase
                     ? '\n\n🎉 **All phases have been executed!** Running final workspace verification...'
                     : `\n\n⏸️ **System Paused.** Local LLM taking a breather to keep memory and CPU cool.\n*Ready for Phase ${phase.number + 1}: ${plan.phases[phaseIndex + 1]?.title || 'Next Phase'}? Click **Proceed to Phase ${phase.number + 1}** above or type in chat to continue.*`),
@@ -1831,6 +1858,10 @@ Output ONLY the file code inside:
                     );
                   }}
                   onExecutePlan={() => {
+                    if (activePlan && activePlan.status === 'paused' && activePlan.currentPhaseIndex < activePlan.phases.length) {
+                      executePhase(activePlan, activePlan.currentPhaseIndex, true);
+                      return;
+                    }
                     const incomplete = planTasks.filter((t) => !t.completed);
                     if (incomplete.length > 0) {
                       handleSendMessage(

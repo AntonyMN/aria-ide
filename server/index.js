@@ -550,7 +550,12 @@ const IGNORED_DIRS = new Set(['.git', 'node_modules', 'dist', 'target', '.cache'
 function buildFileTree(dirPath, currentDepth = 0, maxDepth = 4) {
   if (currentDepth > maxDepth || !fs.existsSync(dirPath)) return [];
 
-  const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+  let entries = [];
+  try {
+    entries = fs.readdirSync(dirPath, { withFileTypes: true });
+  } catch (e) {
+    return [];
+  }
   const result = [];
 
   for (const entry of entries) {
@@ -1967,14 +1972,6 @@ function parsePhasesFromPlan(planMarkdown) {
     const title = match[2].trim();
     const body = match[3] || '';
 
-    const fileMatches = body.match(/Target Files:?\s*([^\n]+)/i);
-    let rawFiles = fileMatches
-      ? fileMatches[1]
-          .split(/[,;]/)
-          .map((s) => s.replace(/[`*'"\\()]/g, '').trim())
-          .filter(Boolean)
-      : [];
-
     const validExts = new Set([
       '.js', '.ts', '.jsx', '.tsx', '.html', '.css', '.json', '.py', '.md',
       '.env', '.sh', '.bash', '.yml', '.yaml', '.sql', '.svg', '.txt', '.php',
@@ -1985,37 +1982,56 @@ function parsePhasesFromPlan(planMarkdown) {
       '.dockerignore', '.editorconfig', '.env.example'
     ]);
 
-    const targetFiles = [];
-    const seenFiles = new Set();
-    for (const f of rawFiles) {
-      const cleanF = f.replace(/^(\.\/|\/)/, '').trim();
-      const lower = cleanF.toLowerCase();
-      if (lower === 'package-lock.json' || lower === 'yarn.lock' || lower === 'pnpm-lock.yaml') continue;
+    // Extract Target Files section (supports inline comma-separated AND multiline bullet list)
+    let targetFiles = [];
+    const fileSectionMatch = body.match(/Target Files:?\*{0,2}\s*([\s\S]*?)(?=(?:-\s*\*{0,2}Commands|\*{0,2}Commands|###|Checklist|$))/i);
+    if (fileSectionMatch) {
+      const rawSection = fileSectionMatch[1];
+      const lines = rawSection.split(/[\r\n]+/);
+      const candidateStrings = [];
+      for (const line of lines) {
+        const cleanLine = line.replace(/^\s*[-*+]\s*/, '').trim();
+        if (!cleanLine) continue;
+        cleanLine.split(/[,;]/).forEach((s) => candidateStrings.push(s));
+      }
 
-      const ext = path.extname(lower);
-      const isExact = validExactNames.has(lower);
-      const hasValidExt = validExts.has(ext);
+      const seenFiles = new Set();
+      for (let raw of candidateStrings) {
+        let cleaned = raw.replace(/\([^\)]*\)/g, '');
+        cleaned = cleaned.replace(/[`*'"\\:]/g, '').trim().replace(/^(\.\/|\/)/, '');
+        if (!cleaned) continue;
 
-      if ((hasValidExt || isExact) && !seenFiles.has(cleanF)) {
-        seenFiles.add(cleanF);
-        targetFiles.push(cleanF);
+        const tokens = cleaned.split(/\s+/);
+        for (const token of tokens) {
+          const lower = token.toLowerCase();
+          if (lower === 'package-lock.json' || lower === 'yarn.lock' || lower === 'pnpm-lock.yaml' || lower === 'implementation_plan.md') continue;
+          const ext = path.extname(lower);
+          if ((validExts.has(ext) || validExactNames.has(lower)) && !seenFiles.has(token)) {
+            seenFiles.add(token);
+            targetFiles.push(token);
+          }
+        }
       }
     }
 
-    const cmdMatches = body.match(/Commands:?\s*([^\n]+)/i);
-    let rawCmds = cmdMatches
-      ? cmdMatches[1]
-          .split(/[,;]/)
-          .map((s) => s.replace(/[`*'"\\()]/g, '').replace(/^[$#]\s*/, '').trim())
-          .filter(Boolean)
-      : [];
-
-    const commands = [];
-    const seenCmds = new Set();
-    for (const c of rawCmds) {
-      if (c && !seenCmds.has(c) && !c.toLowerCase().startsWith('none')) {
-        seenCmds.add(c);
-        commands.push(c);
+    // Extract Commands section (supports inline comma-separated AND multiline bullet list)
+    let commands = [];
+    const cmdSectionMatch = body.match(/Commands:?\*{0,2}\s*([\s\S]*?)(?=(?:-\s*\*{0,2}Checklist|\*{0,2}Checklist|###|$))/i);
+    if (cmdSectionMatch) {
+      const rawSection = cmdSectionMatch[1];
+      const lines = rawSection.split(/[\r\n]+/);
+      const seenCmds = new Set();
+      for (const line of lines) {
+        let cleanLine = line.replace(/^\s*[-*+]\s*/, '').replace(/[`*'"\\]/g, '').replace(/^[$#]\s*/, '').trim();
+        if (!cleanLine || cleanLine.toLowerCase().startsWith('none')) continue;
+        const subCmds = cleanLine.includes(',') && !cleanLine.includes('&&') ? cleanLine.split(',') : [cleanLine];
+        for (let sc of subCmds) {
+          sc = sc.trim();
+          if (sc && !seenCmds.has(sc)) {
+            seenCmds.add(sc);
+            commands.push(sc);
+          }
+        }
       }
     }
 
@@ -2391,6 +2407,7 @@ app.post('/api/agent/stream', async (req, res) => {
       model,
       prompt,
       workspacePath,
+      currentCwd,
       thinkingEnabled,
       mode,
       activeFile,
@@ -2690,7 +2707,7 @@ The Aria backend will automatically create the files on disk and execute the com
           sendEvent('file_error', { path: args.path, error: err.message });
         }
       } else if (fnName === 'run_terminal_command' && args.command && autoExecuteCommands) {
-        let streamCwd = workspaceCwdMap.get(targetWorkspace) || targetWorkspace;
+        let streamCwd = currentCwd || workspaceCwdMap.get(targetWorkspace) || targetWorkspace;
         sendEvent('command_started', { command: args.command, cwd: streamCwd });
         const beforeSnap = inspectDirectorySnapshot(streamCwd);
         const resCmd = await executeCommandLiveStream({
@@ -2773,7 +2790,7 @@ The Aria backend will automatically create the files on disk and execute the com
       }
 
       if (autoExecuteCommands) {
-        let streamCwd = workspaceCwdMap.get(targetWorkspace) || targetWorkspace;
+        let streamCwd = currentCwd || workspaceCwdMap.get(targetWorkspace) || targetWorkspace;
 
         // Run any commands extracted from the model's text synchronously one after another
         for (const ba of bashActions) {

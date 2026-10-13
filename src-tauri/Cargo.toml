@@ -1,10 +1,10 @@
 [package]
-name = "app"
+name = "aria-ide"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
-license = ""
-repository = ""
+description = "Aria IDE - Local Autonomous AI Development Environment"
+authors = ["Aria Contributors"]
+license = "MIT"
+repository = "https://github.com/AntonyMN/aria-ide"
 edition = "2024"
 rust-version = "1.90"
 

@@ -506,23 +506,332 @@ app.get('/api/workspace/activity', (req, res) => {
 // ==========================================
 // 4. TERMINAL & COMMAND EXECUTION (PTY + EXEC)
 // ==========================================
-import { exec } from 'child_process';
+import { exec, spawn } from 'child_process';
 import util from 'util';
 const execPromise = util.promisify(exec);
 
-// Execute a terminal command synchronously with stdout/stderr & error checking
+// Track active terminal WebSocket clients to broadcast directory updates
+const terminalClients = new Set();
+function broadcastToTerminal(data) {
+  for (const client of terminalClients) {
+    if (client.readyState === 1) { // 1 = WebSocket.OPEN
+      try {
+        client.send(JSON.stringify(data));
+      } catch (e) {}
+    }
+  }
+}
+
+// Active workspace working directory map (remembers current subfolder per workspace)
+const workspaceCwdMap = new Map();
+
+// Helper to snapshot directory structure
+function inspectDirectorySnapshot(dirPath) {
+  if (!dirPath || !fs.existsSync(dirPath)) return { dirs: [], files: [], all: [] };
+  try {
+    const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+    const dirs = [];
+    const files = [];
+    for (const e of entries) {
+      if (IGNORED_DIRS.has(e.name)) continue;
+      if (e.isDirectory()) dirs.push(e.name);
+      else files.push(e.name);
+    }
+    return { dirs, files, all: entries.map((e) => e.name) };
+  } catch (e) {
+    return { dirs: [], files: [], all: [] };
+  }
+}
+
+// Helper: Run a terminal command with live streaming stdout/stderr chunks
+function executeCommandLiveStream({ command, cwd, onStdout, onStderr, signal }) {
+  return new Promise((resolve) => {
+    const shell = process.env.SHELL || '/bin/bash';
+    const child = spawn(command, {
+      shell: true,
+      cwd,
+      env: { ...process.env, FORCE_COLOR: '1' },
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    if (signal) {
+      signal.addEventListener('abort', () => {
+        try {
+          child.kill('SIGINT');
+        } catch (e) {}
+        setTimeout(() => {
+          try {
+            child.kill('SIGKILL');
+          } catch (e) {}
+        }, 1200);
+      });
+    }
+
+    child.stdout.on('data', (data) => {
+      const str = data.toString();
+      stdout += str;
+      onStdout?.(str);
+    });
+
+    child.stderr.on('data', (data) => {
+      const str = data.toString();
+      stderr += str;
+      onStderr?.(str);
+    });
+
+    child.on('error', (err) => {
+      resolve({
+        success: false,
+        exitCode: 1,
+        stdout,
+        stderr: stderr + '\n' + err.message,
+        hasError: true,
+      });
+    });
+
+    child.on('close', (exitCode) => {
+      resolve({
+        success: exitCode === 0,
+        exitCode: exitCode ?? 0,
+        stdout,
+        stderr,
+        hasError: exitCode !== 0,
+      });
+    });
+  });
+}
+
+// Helper: Audit executed command and resulting structure changes using LLM & heuristics
+async function auditCommandAndStructure({
+  command,
+  exitCode,
+  stdout = '',
+  stderr = '',
+  currentCwd,
+  workspacePath,
+  createdDirs = [],
+  createdFiles = [],
+  model = 'granite4.2:8b',
+  goalContext = '',
+}) {
+  const targetWorkspace = workspacePath || process.cwd();
+  const currentDir = currentCwd || targetWorkspace;
+
+  // 1. Inspect newly created directories in detail (e.g. files inside newly created 'blog')
+  let subDirDetails = '';
+  for (const dirName of createdDirs.slice(0, 3)) {
+    const subPath = path.join(currentDir, dirName);
+    if (fs.existsSync(subPath) && fs.statSync(subPath).isDirectory()) {
+      try {
+        const subEntries = fs.readdirSync(subPath).slice(0, 15);
+        subDirDetails += `\nContents of newly created folder '${dirName}':\n[${subEntries.join(', ')}]\n`;
+      } catch (e) {}
+    }
+  }
+
+  // 2. Fallback Heuristics: guaranteed detection of project creation & cd commands
+  let fallbackSuggestedCwd = null;
+  let fallbackSummary =
+    exitCode === 0
+      ? `Command "${command}" executed successfully.`
+      : `Command "${command}" exited with code ${exitCode}.`;
+  let fallbackWayForward = '';
+  let fallbackNextCommands = [];
+
+  // Detect explicit cd command
+  const cdMatch = command.match(/(?:^|&&|;)\s*cd\s+([^;&]+)/);
+  if (cdMatch) {
+    const targetDir = cdMatch[1].trim().replace(/^['"]|['"]$/g, '');
+    const resolved = path.resolve(currentDir, targetDir);
+    if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
+      fallbackSuggestedCwd = resolved;
+      fallbackSummary = `Navigated into directory "${targetDir}".`;
+    }
+  }
+
+  // Detect project scaffolding commands: laravel new <name>, npx create-... <name>, cargo new <name>, mkdir <name>
+  const scaffoldMatch = command.match(
+    /(?:laravel\s+new|create-react-app|create-vite|create-vue|cargo\s+new|mkdir|git\s+clone[^\n]+\/)\s+([a-zA-Z0-9_\-.]+)/i
+  );
+  if (scaffoldMatch) {
+    const candidateName = scaffoldMatch[1].trim();
+    const candidatePath = path.resolve(currentDir, candidateName);
+    const dirExists =
+      createdDirs.includes(candidateName) ||
+      (fs.existsSync(candidatePath) && fs.statSync(candidatePath).isDirectory());
+    if (dirExists) {
+      fallbackSuggestedCwd = candidatePath;
+      fallbackSummary = `Project folder "${candidateName}" created. Working directory shifted to "${candidateName}".`;
+      fallbackWayForward = `Navigate into "${candidateName}" and verify scaffolding or install dependencies.`;
+
+      if (fs.existsSync(path.join(candidatePath, 'composer.json')) || command.includes('laravel')) {
+        fallbackNextCommands = ['composer install'];
+      } else if (fs.existsSync(path.join(candidatePath, 'package.json')) || command.includes('create-')) {
+        fallbackNextCommands = ['npm install'];
+      }
+    }
+  }
+
+  // If createdDirs has 1 new directory and exitCode === 0, suggest navigating into it
+  if (!fallbackSuggestedCwd && createdDirs.length === 1 && exitCode === 0) {
+    const onlyDir = path.resolve(currentDir, createdDirs[0]);
+    fallbackSuggestedCwd = onlyDir;
+    fallbackSummary = `Created new directory "${createdDirs[0]}". Working directory moved into "${createdDirs[0]}".`;
+    fallbackWayForward = `Enter "${createdDirs[0]}" to proceed with subsequent configuration.`;
+  }
+
+  // 3. Query LLM for intelligent audit & way forward if model is available
+  let llmAudit = null;
+  try {
+    const prompt = `You are the Autonomous Command & Workspace Structure Auditor in Aria IDE.
+A shell command has executed.
+
+COMMAND: ${command}
+WORKING DIRECTORY: ${currentDir}
+EXIT CODE: ${exitCode}
+${stdout ? `STDOUT (recent output):\n${stdout.slice(-800)}\n` : ''}
+${stderr ? `STDERR (recent output):\n${stderr.slice(-800)}\n` : ''}
+NEW FOLDERS CREATED: ${createdDirs.join(', ') || 'None'}
+NEW FILES CREATED: ${createdFiles.join(', ') || 'None'}
+${subDirDetails}
+TASK CONTEXT: ${goalContext || 'Sequential task execution'}
+
+CRITICAL AUDIT RULES:
+1. If the command created a new project directory (e.g. "laravel new blog", "npx create-vite-app blog", "cargo new myapp"), the system MUST go inside that folder. Set "suggestedCwd" to that folder name.
+2. Determine if the structure is correct and what the exact WAY FORWARD is.
+3. Suggest the immediate next 1-2 commands to run sequentially.
+
+You MUST respond ONLY with a valid JSON object matching this schema:
+{
+  "status": "success" | "warning" | "error",
+  "summary": "Clear summary of the result and structure changes",
+  "suggestedCwd": "subfolder name or relative path to enter, or null to stay in current directory",
+  "wayForward": "Actionable explanation of current state and what should be done next",
+  "suggestedNextCommands": ["next_command_1", "next_command_2"]
+}`;
+
+    const auditRes = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: 'user', content: prompt }],
+        stream: false,
+        options: { temperature: 0.1, num_predict: 500 },
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+
+    if (auditRes.ok) {
+      const data = await auditRes.json();
+      const content = data.message?.content || '';
+      const jsonMatch = content.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        llmAudit = JSON.parse(jsonMatch[0]);
+      }
+    }
+  } catch (err) {
+    // LLM timeout or offline; fallback heuristic handles it gracefully
+  }
+
+  // Resolve final new CWD
+  let finalNewCwd = currentDir;
+  let finalRelativeCwd = path.relative(targetWorkspace, currentDir) || '.';
+
+  const rawSuggested =
+    llmAudit?.suggestedCwd ||
+    (fallbackSuggestedCwd ? path.relative(currentDir, fallbackSuggestedCwd) : null);
+
+  if (
+    rawSuggested &&
+    typeof rawSuggested === 'string' &&
+    rawSuggested.toLowerCase() !== 'null' &&
+    rawSuggested !== '.'
+  ) {
+    const resolvedPath = path.isAbsolute(rawSuggested)
+      ? rawSuggested
+      : path.resolve(currentDir, rawSuggested);
+    const candidateBase = path.basename(resolvedPath);
+    if (
+      (fs.existsSync(resolvedPath) && fs.statSync(resolvedPath).isDirectory()) ||
+      createdDirs.includes(rawSuggested) ||
+      createdDirs.includes(candidateBase) ||
+      (fallbackSuggestedCwd && resolvedPath === fallbackSuggestedCwd)
+    ) {
+      finalNewCwd = resolvedPath;
+      finalRelativeCwd = path.relative(targetWorkspace, resolvedPath) || '.';
+    }
+  } else if (fallbackSuggestedCwd) {
+    finalNewCwd = fallbackSuggestedCwd;
+    finalRelativeCwd = path.relative(targetWorkspace, fallbackSuggestedCwd) || '.';
+  }
+
+  return {
+    command,
+    exitCode,
+    success: exitCode === 0,
+    stdout,
+    stderr,
+    oldCwd: currentDir,
+    newCwd: finalNewCwd,
+    relativeCwd: finalRelativeCwd,
+    createdDirs,
+    createdFiles,
+    status: llmAudit?.status || (exitCode === 0 ? 'success' : 'error'),
+    summary: llmAudit?.summary || fallbackSummary,
+    wayForward:
+      llmAudit?.wayForward ||
+      fallbackWayForward ||
+      (exitCode === 0 ? 'Ready for next step.' : 'Please fix the command error before proceeding.'),
+    suggestedNextCommands:
+      llmAudit?.suggestedNextCommands && llmAudit.suggestedNextCommands.length > 0
+        ? llmAudit.suggestedNextCommands
+        : fallbackNextCommands,
+  };
+}
+
+// 4.1 Execute a terminal command synchronously with stdout/stderr & error checking
 app.post('/api/terminal/run', async (req, res) => {
-  const { command, cwd } = req.body;
+  const { command, cwd, workspacePath, autoAudit = true, model } = req.body;
   if (!command) return res.status(400).json({ error: 'command is required' });
 
-  const workingDir = cwd && fs.existsSync(cwd) ? cwd : process.cwd();
+  const targetWorkspace = workspacePath || process.cwd();
+  const workingDir = cwd && fs.existsSync(cwd) ? cwd : (workspaceCwdMap.get(targetWorkspace) || targetWorkspace);
+
+  const beforeSnap = inspectDirectorySnapshot(workingDir);
 
   try {
     const { stdout, stderr } = await execPromise(command, {
       cwd: workingDir,
-      timeout: 60000,
-      maxBuffer: 5 * 1024 * 1024,
+      timeout: 120000,
+      maxBuffer: 10 * 1024 * 1024,
     });
+
+    const afterSnap = inspectDirectorySnapshot(workingDir);
+    const createdDirs = afterSnap.dirs.filter((d) => !beforeSnap.dirs.includes(d));
+    const createdFiles = afterSnap.files.filter((f) => !beforeSnap.files.includes(f));
+
+    let audit = null;
+    if (autoAudit) {
+      audit = await auditCommandAndStructure({
+        command,
+        exitCode: 0,
+        stdout,
+        stderr,
+        currentCwd: workingDir,
+        workspacePath: targetWorkspace,
+        createdDirs,
+        createdFiles,
+        model,
+      });
+
+      if (audit.newCwd !== workingDir) {
+        workspaceCwdMap.set(targetWorkspace, audit.newCwd);
+        broadcastToTerminal({ type: 'set_cwd', cwd: audit.newCwd });
+      }
+    }
 
     res.json({
       success: true,
@@ -530,20 +839,261 @@ app.post('/api/terminal/run', async (req, res) => {
       stdout,
       stderr,
       hasError: false,
+      audit,
+      newCwd: audit ? audit.newCwd : workingDir,
     });
   } catch (err) {
+    const afterSnap = inspectDirectorySnapshot(workingDir);
+    const createdDirs = afterSnap.dirs.filter((d) => !beforeSnap.dirs.includes(d));
+    const createdFiles = afterSnap.files.filter((f) => !beforeSnap.files.includes(f));
+
+    let audit = null;
+    if (autoAudit) {
+      audit = await auditCommandAndStructure({
+        command,
+        exitCode: err.code || 1,
+        stdout: err.stdout || '',
+        stderr: err.stderr || err.message,
+        currentCwd: workingDir,
+        workspacePath: targetWorkspace,
+        createdDirs,
+        createdFiles,
+        model,
+      });
+    }
+
     res.json({
       success: false,
       exitCode: err.code || 1,
       stdout: err.stdout || '',
       stderr: err.stderr || err.message,
       hasError: true,
+      audit,
+      newCwd: workingDir,
     });
   }
 });
 
+// 4.2 Endpoint: Run commands synchronously in real-time, showing live output on screen, and audit each step
+app.post('/api/terminal/run-live-stream', async (req, res) => {
+  const {
+    commands = [],
+    workspacePath,
+    initialCwd,
+    model = 'granite4.2:8b',
+    goalContext = '',
+  } = req.body;
+
+  if (!Array.isArray(commands) || commands.length === 0) {
+    return res.status(400).json({ error: 'commands array is required' });
+  }
+
+  // Setup SSE streaming
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const sendEvent = (event, data) => {
+    try {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    } catch (e) {}
+  };
+
+  const controller = new AbortController();
+  activeGenerations.add(controller);
+
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      controller.abort();
+    }
+    activeGenerations.delete(controller);
+  });
+
+  const targetWorkspace = workspacePath || process.cwd();
+  let activeCwd = initialCwd && fs.existsSync(initialCwd)
+    ? initialCwd
+    : (workspaceCwdMap.get(targetWorkspace) || targetWorkspace);
+
+  sendEvent('queue_started', {
+    total: commands.length,
+    commands,
+    currentCwd: activeCwd,
+  });
+
+  const executionResults = [];
+
+  for (let i = 0; i < commands.length; i++) {
+    if (controller.signal.aborted) {
+      sendEvent('interrupted', { index: i, reason: 'Aborted by user' });
+      break;
+    }
+
+    const rawCmd = commands[i].trim().replace(/^[$#]\s*/, '');
+    if (!rawCmd) continue;
+
+    sendEvent('command_started', {
+      index: i,
+      command: rawCmd,
+      cwd: activeCwd,
+      relativeCwd: path.relative(targetWorkspace, activeCwd) || '.',
+    });
+
+    const beforeSnap = inspectDirectorySnapshot(activeCwd);
+
+    const runRes = await executeCommandLiveStream({
+      command: rawCmd,
+      cwd: activeCwd,
+      onStdout: (chunk) => sendEvent('command_stdout', { index: i, chunk }),
+      onStderr: (chunk) => sendEvent('command_stderr', { index: i, chunk }),
+      signal: controller.signal,
+    });
+
+    sendEvent('command_finished', {
+      index: i,
+      exitCode: runRes.exitCode,
+      success: runRes.success,
+    });
+
+    const afterSnap = inspectDirectorySnapshot(activeCwd);
+    const createdDirs = afterSnap.dirs.filter((d) => !beforeSnap.dirs.includes(d));
+    const createdFiles = afterSnap.files.filter((f) => !beforeSnap.files.includes(f));
+
+    // Audit command and structure with LLM
+    sendEvent('audit_started', { index: i, command: rawCmd });
+
+    const audit = await auditCommandAndStructure({
+      command: rawCmd,
+      exitCode: runRes.exitCode,
+      stdout: runRes.stdout,
+      stderr: runRes.stderr,
+      currentCwd: activeCwd,
+      workspacePath: targetWorkspace,
+      createdDirs,
+      createdFiles,
+      model,
+      goalContext,
+    });
+
+    sendEvent('command_audited', { index: i, audit });
+
+    appendIdeActivity(targetWorkspace, {
+      type: 'command_audited',
+      command: rawCmd,
+      exitCode: runRes.exitCode,
+      success: runRes.success,
+      auditSummary: audit.summary,
+      newCwd: audit.relativeCwd,
+    });
+
+    // Update active CWD if audit detected transition into new directory (e.g. blog)
+    if (audit.newCwd !== activeCwd) {
+      activeCwd = audit.newCwd;
+      workspaceCwdMap.set(targetWorkspace, activeCwd);
+      broadcastToTerminal({ type: 'set_cwd', cwd: activeCwd });
+      sendEvent('cwd_changed', {
+        newCwd: activeCwd,
+        relativeCwd: audit.relativeCwd,
+      });
+    }
+
+    executionResults.push({
+      command: rawCmd,
+      ...runRes,
+      audit,
+      cwd: activeCwd,
+    });
+
+    // If command failed critically, pause the queue to give user & LLM opportunity to review
+    if (runRes.hasError) {
+      sendEvent('queue_paused', {
+        index: i,
+        command: rawCmd,
+        error: runRes.stderr || 'Command failed with non-zero exit code',
+        audit,
+      });
+      break;
+    }
+  }
+
+  sendEvent('queue_completed', {
+    completed: !controller.signal.aborted,
+    finalCwd: activeCwd,
+    relativeCwd: path.relative(targetWorkspace, activeCwd) || '.',
+    results: executionResults,
+  });
+
+  activeGenerations.delete(controller);
+  res.end();
+});
+
+// 4.3 Endpoint: Dedicated command audit
+app.post('/api/agent/audit-command', async (req, res) => {
+  try {
+    const {
+      command,
+      exitCode,
+      stdout,
+      stderr,
+      currentCwd,
+      workspacePath,
+      createdDirs = [],
+      createdFiles = [],
+      model,
+      goalContext,
+    } = req.body;
+
+    const audit = await auditCommandAndStructure({
+      command,
+      exitCode: exitCode ?? 0,
+      stdout: stdout || '',
+      stderr: stderr || '',
+      currentCwd,
+      workspacePath,
+      createdDirs,
+      createdFiles,
+      model,
+      goalContext,
+    });
+
+    res.json(audit);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 4.4 Get/Set Active Working Directory for a Workspace
+app.get('/api/agent/cwd', (req, res) => {
+  const workspacePath = req.query.workspace || process.cwd();
+  const cwd = workspaceCwdMap.get(workspacePath) || workspacePath;
+  res.json({
+    workspacePath,
+    currentCwd: cwd,
+    relativeCwd: path.relative(workspacePath, cwd) || '.',
+  });
+});
+
+app.post('/api/agent/cwd', (req, res) => {
+  const { workspacePath, newCwd } = req.body;
+  if (!workspacePath || !newCwd) {
+    return res.status(400).json({ error: 'workspacePath and newCwd are required' });
+  }
+  const resolved = path.isAbsolute(newCwd) ? newCwd : path.resolve(workspacePath, newCwd);
+  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
+    return res.status(400).json({ error: `Directory does not exist: ${newCwd}` });
+  }
+  workspaceCwdMap.set(workspacePath, resolved);
+  broadcastToTerminal({ type: 'set_cwd', cwd: resolved });
+  res.json({
+    success: true,
+    currentCwd: resolved,
+    relativeCwd: path.relative(workspacePath, resolved) || '.',
+  });
+});
+
 // WebSocket Terminal PTY stream for interactive bash terminal in the IDE
 wss.on('connection', (ws) => {
+  terminalClients.add(ws);
   const shell = process.env.SHELL || '/bin/bash';
   let ptyProcess = null;
 
@@ -587,6 +1137,7 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
+    terminalClients.delete(ws);
     if (ptyProcess) {
       try {
         ptyProcess.kill();
@@ -804,7 +1355,7 @@ function updateIdeContextMarkdown(workspacePath, activityLog = []) {
       })
       .join('\n');
 
-    const content = `# Antigravity IDE Workspace Context
+    const content = `# Aria IDE Workspace Context
 **Workspace Path:** \`${workspacePath}\`
 **Last Updated:** ${new Date().toLocaleString()}
 
@@ -847,30 +1398,41 @@ async function runWorkspaceCommand(workspacePath, command) {
   }
 }
 
-function extractActionsFromText(text) {
+function extractActionsFromText(text, expectedTargetFiles = []) {
   const fileActions = [];
   const bashActions = [];
 
-  // 1. Explicit ```file:filename.ext
+  // 1. Explicit ```file:filename.ext or ```write:filename.ext or ```create:filename.ext
   const filePattern = /```(?:file|write|create):([^\n\r]+)[\r\n]([\s\S]*?)```/g;
   let match;
   while ((match = filePattern.exec(text)) !== null) {
-    const filePath = match[1].trim();
+    const rawPath = match[1].trim().replace(/^['"`]+|['"`]+$/g, '').replace(/^(\.\/|\/)/, '');
     const content = match[2];
-    fileActions.push({ path: filePath, content });
+    if (rawPath && !fileActions.some((f) => f.path === rawPath)) {
+      fileActions.push({ path: rawPath, content });
+    }
   }
 
-  // 2. Explicit ```bash:run or ```sh:run
-  const bashPattern = /```(?:bash|sh|cmd):run[\r\n]([\s\S]*?)```/g;
+  // 2. Standard bash/sh/shell blocks: ```(?:bash|sh|cmd|shell|zsh)(?::run)?[\r\n]([\s\S]*?)```
+  const bashPattern = /```(?:bash|sh|cmd|shell|zsh)(?::run)?[\r\n]([\s\S]*?)```/gi;
   while ((match = bashPattern.exec(text)) !== null) {
-    const command = match[1].trim();
-    if (command) bashActions.push({ command });
+    const rawBlock = match[1].trim();
+    const lines = rawBlock.split(/[\r\n]+/);
+    for (let line of lines) {
+      line = line.trim().replace(/^[$#]\s*/, '').trim();
+      // Ignore comments, empty lines, or solitary cd commands
+      if (!line || line.startsWith('#') || line.startsWith('//')) continue;
+      if (line.startsWith('cd ') && !line.includes('&&') && !line.includes(';')) continue;
+      if (!bashActions.some((b) => b.command === line)) {
+        bashActions.push({ command: line });
+      }
+    }
   }
 
   // 3. Fallback Heuristic: standard code block preceded by filename (e.g. "create a new JavaScript file ( script.js ) to handle... ```javascript")
-  const heuristicPattern = /(?:create|file|in|named|modify|write|add)?\s*[`(]?([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]{1,8})[`)\]:]?\s*(?:to handle[^\n]*|:\s*)?\n+```(?:[a-zA-Z0-9_-]+)?\n([\s\S]*?)```/gi;
+  const heuristicPattern = /(?:create|file|in|named|modify|write|add|for|update)?\s*[`(]?([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]{1,8})[`)\]:]?\s*(?:to handle[^\n]*|:\s*|---\s*)?\n+```(?:[a-zA-Z0-9_-]+)?\n([\s\S]*?)```/gi;
   while ((match = heuristicPattern.exec(text)) !== null) {
-    const candidatePath = match[1].trim();
+    const candidatePath = match[1].trim().replace(/^['"`]+|['"`]+$/g, '').replace(/^(\.\/|\/)/, '');
     const code = match[2];
     if (!candidatePath.includes(' ') && !fileActions.some((f) => f.path === candidatePath) && code.trim().length > 0) {
       const ext = path.extname(candidatePath).toLowerCase();
@@ -880,10 +1442,36 @@ function extractActionsFromText(text) {
     }
   }
 
-  // 4. Fallback Heuristic: JSON tool call emitted in text by smaller models
+  // 4. Code block with first line comment containing filename: e.g. // index.js or /* style.css */ or <!-- index.html -->
+  const blockWithCommentPattern = /```(?:[a-zA-Z0-9_-]+)?[\r\n]+(?:\/\/|#|<!--|\/\*)\s*([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]{1,8})(?:\s*-->|\s*\*\/)?[\r\n]([\s\S]*?)```/g;
+  while ((match = blockWithCommentPattern.exec(text)) !== null) {
+    const candidatePath = match[1].trim().replace(/^['"`]+|['"`]+$/g, '').replace(/^(\.\/|\/)/, '');
+    const code = match[2];
+    if (!candidatePath.includes(' ') && !fileActions.some((f) => f.path === candidatePath) && code.trim().length > 0) {
+      const ext = path.extname(candidatePath).toLowerCase();
+      if (['.js', '.ts', '.jsx', '.tsx', '.html', '.css', '.json', '.py', '.php', '.rs', '.vue', '.sh', '.md', '.sql'].includes(ext)) {
+        fileActions.push({ path: candidatePath, content: code });
+      }
+    }
+  }
+
+  // 5. Header or bold filename immediately before code block: e.g. ### `index.html`\n```html or **styles.css**\n```css
+  const headerOrBoldPattern = /(?:###?\s+|[*_]{1,2}|`)([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]{1,8})(?:[*_]{1,2}|`|:)?[\r\n]+```(?:[a-zA-Z0-9_-]+)?[\r\n]([\s\S]*?)```/g;
+  while ((match = headerOrBoldPattern.exec(text)) !== null) {
+    const candidatePath = match[1].trim().replace(/^['"`]+|['"`]+$/g, '').replace(/^(\.\/|\/)/, '');
+    const code = match[2];
+    if (!candidatePath.includes(' ') && !fileActions.some((f) => f.path === candidatePath) && code.trim().length > 0) {
+      const ext = path.extname(candidatePath).toLowerCase();
+      if (['.js', '.ts', '.jsx', '.tsx', '.html', '.css', '.json', '.py', '.php', '.rs', '.vue', '.sh', '.md', '.sql'].includes(ext)) {
+        fileActions.push({ path: candidatePath, content: code });
+      }
+    }
+  }
+
+  // 6. JSON tool call emitted in text by smaller models
   const jsonToolPattern = /\{\s*"name"\s*:\s*"write_file"\s*,\s*"arguments"\s*:\s*\{[\s\S]*?"path"\s*:\s*"([^"]+)"[\s\S]*?"content"\s*:\s*"([\s\S]*?)"\s*\}\s*\}/g;
   while ((match = jsonToolPattern.exec(text)) !== null) {
-    const p = match[1];
+    const p = match[1].replace(/^['"`]+|['"`]+$/g, '').replace(/^(\.\/|\/)/, '');
     let c = match[2];
     try {
       c = JSON.parse(`"${c}"`);
@@ -893,28 +1481,52 @@ function extractActionsFromText(text) {
     }
   }
 
-  // 5. Code block with first line comment containing filename: e.g. // index.js or /* style.css */ or <!-- index.html -->
-  const blockWithCommentPattern = /```(?:[a-zA-Z0-9_-]+)?[\r\n]+(?:\/\/|#|<!--|\/\*)\s*([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]{1,8})(?:\s*-->|\s*\*\/)?[\r\n]([\s\S]*?)```/g;
-  while ((match = blockWithCommentPattern.exec(text)) !== null) {
-    const candidatePath = match[1].trim();
-    const code = match[2];
-    if (!candidatePath.includes(' ') && !fileActions.some((f) => f.path === candidatePath) && code.trim().length > 0) {
-      const ext = path.extname(candidatePath).toLowerCase();
-      if (['.js', '.ts', '.jsx', '.tsx', '.html', '.css', '.json', '.py', '.php', '.rs', '.vue', '.sh', '.md', '.sql'].includes(ext)) {
-        fileActions.push({ path: candidatePath, content: code });
-      }
-    }
-  }
+  // 7. Heuristic with expectedTargetFiles:
+  // If target files were specified for this phase and haven't been matched yet:
+  if (Array.isArray(expectedTargetFiles) && expectedTargetFiles.length > 0) {
+    const missingTargets = expectedTargetFiles
+      .map((t) => t.replace(/^['"`]+|['"`]+$/g, '').replace(/^(\.\/|\/)/, '').trim())
+      .filter((t) => t && !fileActions.some((fa) => fa.path.toLowerCase() === t.toLowerCase() || fa.path.toLowerCase().endsWith('/' + t.toLowerCase())));
 
-  // 6. Header or bold filename immediately before code block: e.g. ### `index.html`\n```html or **styles.css**\n```css
-  const headerOrBoldPattern = /(?:###?\s+|[*_]{1,2}|`)([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]{1,8})(?:[*_]{1,2}|`|:)?[\r\n]+```(?:[a-zA-Z0-9_-]+)?[\r\n]([\s\S]*?)```/g;
-  while ((match = headerOrBoldPattern.exec(text)) !== null) {
-    const candidatePath = match[1].trim();
-    const code = match[2];
-    if (!candidatePath.includes(' ') && !fileActions.some((f) => f.path === candidatePath) && code.trim().length > 0) {
-      const ext = path.extname(candidatePath).toLowerCase();
-      if (['.js', '.ts', '.jsx', '.tsx', '.html', '.css', '.json', '.py', '.php', '.rs', '.vue', '.sh', '.md', '.sql'].includes(ext)) {
-        fileActions.push({ path: candidatePath, content: code });
+    if (missingTargets.length > 0) {
+      const genericBlockPattern = /```([a-zA-Z0-9_-]+)?[\r\n]([\s\S]*?)```/g;
+      let gMatch;
+      while ((gMatch = genericBlockPattern.exec(text)) !== null) {
+        const lang = (gMatch[1] || '').toLowerCase();
+        const code = gMatch[2].trim();
+        // Skip bash / terminal blocks
+        if (['bash', 'sh', 'cmd', 'shell', 'zsh', 'terminal'].includes(lang)) continue;
+        if (code.length < 15) continue;
+
+        const blockIndex = gMatch.index;
+        const precedingText = text.substring(Math.max(0, blockIndex - 300), blockIndex);
+
+        let matchedTarget = null;
+        for (const target of missingTargets) {
+          if (precedingText.toLowerCase().includes(target.toLowerCase())) {
+            matchedTarget = target;
+            break;
+          }
+        }
+
+        // If not mentioned directly, but there is only 1 missing target file and the code extension matches
+        if (!matchedTarget && missingTargets.length === 1) {
+          const onlyTarget = missingTargets[0];
+          const targetExt = path.extname(onlyTarget).toLowerCase();
+          const langMap = {
+            js: '.js', javascript: '.js', ts: '.ts', typescript: '.ts',
+            html: '.html', css: '.css', json: '.json', py: '.py', python: '.py'
+          };
+          if (langMap[lang] === targetExt || (!lang && code.length > 20)) {
+            matchedTarget = onlyTarget;
+          }
+        }
+
+        if (matchedTarget && !fileActions.some((f) => f.path === matchedTarget)) {
+          fileActions.push({ path: matchedTarget, content: code });
+          const idx = missingTargets.indexOf(matchedTarget);
+          if (idx !== -1) missingTargets.splice(idx, 1);
+        }
       }
     }
   }
@@ -932,20 +1544,56 @@ function parsePhasesFromPlan(planMarkdown) {
     const body = match[3] || '';
 
     const fileMatches = body.match(/Target Files:?\s*([^\n]+)/i);
-    const targetFiles = fileMatches
+    let rawFiles = fileMatches
       ? fileMatches[1]
           .split(/[,;]/)
-          .map((s) => s.replace(/[`*]/g, '').trim())
+          .map((s) => s.replace(/[`*'"\\()]/g, '').trim())
           .filter(Boolean)
       : [];
 
+    const validExts = new Set([
+      '.js', '.ts', '.jsx', '.tsx', '.html', '.css', '.json', '.py', '.md',
+      '.env', '.sh', '.bash', '.yml', '.yaml', '.sql', '.svg', '.txt', '.php',
+      '.rs', '.go', '.vue', '.svelte', '.xml'
+    ]);
+    const validExactNames = new Set([
+      '.gitignore', '.npmignore', 'dockerfile', 'makefile', 'procfile',
+      '.dockerignore', '.editorconfig', '.env.example'
+    ]);
+
+    const targetFiles = [];
+    const seenFiles = new Set();
+    for (const f of rawFiles) {
+      const cleanF = f.replace(/^(\.\/|\/)/, '').trim();
+      const lower = cleanF.toLowerCase();
+      if (lower === 'package-lock.json' || lower === 'yarn.lock' || lower === 'pnpm-lock.yaml') continue;
+
+      const ext = path.extname(lower);
+      const isExact = validExactNames.has(lower);
+      const hasValidExt = validExts.has(ext);
+
+      if ((hasValidExt || isExact) && !seenFiles.has(cleanF)) {
+        seenFiles.add(cleanF);
+        targetFiles.push(cleanF);
+      }
+    }
+
     const cmdMatches = body.match(/Commands:?\s*([^\n]+)/i);
-    const commands = cmdMatches
+    let rawCmds = cmdMatches
       ? cmdMatches[1]
           .split(/[,;]/)
-          .map((s) => s.replace(/[`*]/g, '').trim())
+          .map((s) => s.replace(/[`*'"\\()]/g, '').replace(/^[$#]\s*/, '').trim())
           .filter(Boolean)
       : [];
+
+    const commands = [];
+    const seenCmds = new Set();
+    for (const c of rawCmds) {
+      if (c && !seenCmds.has(c) && !c.toLowerCase().startsWith('none')) {
+        seenCmds.add(c);
+        commands.push(c);
+      }
+    }
 
     phases.push({
       id: `phase-${num}-${Date.now()}`,
@@ -1006,6 +1654,142 @@ app.post('/api/agent/stop', (req, res) => {
   res.json({ success: true, stopped: count });
 });
 
+// Endpoint: Interrupt active execution with new guidance & dynamically revise the plan
+app.post('/api/agent/interrupt', async (req, res) => {
+  const {
+    model,
+    workspacePath,
+    currentCwd,
+    interruptionMessage,
+    activePlan,
+    completedPhases = [],
+    executedCommands = [],
+    writtenFiles = [],
+  } = req.body;
+
+  if (!interruptionMessage) {
+    return res.status(400).json({ error: 'interruptionMessage is required' });
+  }
+
+  // 1. Abort any active streaming / generation operations
+  let stopped = 0;
+  for (const c of activeGenerations) {
+    try {
+      c.abort();
+      stopped++;
+    } catch (e) {}
+  }
+  activeGenerations.clear();
+
+  const targetWorkspace = workspacePath || process.cwd();
+  const effectiveCwd = currentCwd || (workspaceCwdMap.get(targetWorkspace) || targetWorkspace);
+
+  // 2. Snapshot current workspace directory
+  const tree = buildFileTree(effectiveCwd, 0, 2);
+  const fileListSnippet = tree.map((t) => (t.isDirectory ? `📁 ${t.name}/` : `📄 ${t.name}`)).join('\n');
+
+  const architectPrompt = `You are the Lead Software Architect of Aria IDE.
+The user has INTERRUPTED execution mid-flight with new/updated requirements.
+
+CURRENT SYSTEM & EXECUTION STATE:
+- Active Working Directory: ${effectiveCwd} (relative: ${path.relative(targetWorkspace, effectiveCwd) || '.'})
+- Current Files in Directory:
+${fileListSnippet || '(Empty directory)'}
+- Commands Already Executed:
+${executedCommands.length > 0 ? executedCommands.map((c) => `- ${c.command} (exit: ${c.exitCode})`).join('\n') : 'None'}
+- Files Already Created:
+${writtenFiles.length > 0 ? writtenFiles.map((f) => `- ${f.path}`).join('\n') : 'None'}
+
+USER INTERRUPTION & NEW INSTRUCTIONS:
+"${interruptionMessage}"
+
+EXISTING PLAN PHASES:
+${activePlan ? JSON.stringify(activePlan.phases || [], null, 2) : 'None'}
+
+TASK:
+1. Audit what has already been created/executed. Do NOT re-create or re-run what is already done and valid.
+2. Adapt and update the remaining phases and sequential commands based on the user's new instructions.
+3. If the user changed the directory, stack, or tools, reflect that in the new phases.
+
+Your response MUST be an updated Phased Implementation Plan following this exact markdown format:
+
+# Implementation Plan (Updated via User Interruption)
+
+## Overview
+Summary of how the architecture and plan adapt to: "${interruptionMessage}".
+
+## Phased Execution Roadmap
+
+### Phase 1: [Phase Title]
+- **Goal:** [What this phase accomplishes]
+- **Target Files:** [Comma-separated file names with extensions, e.g. .env, package.json]
+- **Commands:** [Comma-separated commands to execute, e.g. composer require ..., npm install ...]
+- **Checklist:**
+- [ ] [Specific actionable step]
+- [ ] [Specific actionable step]
+
+(Provide remaining phases as needed)`;
+
+  try {
+    const selectedModel = model || 'granite4.2:8b';
+    const ollamaRes = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: selectedModel,
+        messages: [{ role: 'user', content: architectPrompt }],
+        stream: false,
+        options: { temperature: 0.2, num_predict: 4096 },
+      }),
+    });
+
+    if (!ollamaRes.ok) {
+      const err = await ollamaRes.text();
+      throw new Error(`Ollama error: ${err}`);
+    }
+
+    const data = await ollamaRes.json();
+    const planMarkdown = data.message?.content || '';
+    const phases = parsePhasesFromPlan(planMarkdown);
+
+    // Parse checklist tasks
+    const tasks = [];
+    const taskRegex = /- \[(?: |x)\] ([^\n]+)/g;
+    let tMatch;
+    let tIdx = 1;
+    while ((tMatch = taskRegex.exec(planMarkdown)) !== null) {
+      tasks.push({
+        id: `task-revised-${tIdx}-${Date.now()}`,
+        title: tMatch[1].trim(),
+        completed: false,
+      });
+      tIdx++;
+    }
+
+    // Save updated plan to workspace
+    const planFileAbs = path.join(targetWorkspace, 'IMPLEMENTATION_PLAN.md');
+    try {
+      fs.writeFileSync(planFileAbs, planMarkdown, 'utf8');
+    } catch (e) {}
+
+    appendIdeActivity(targetWorkspace, {
+      type: 'interrupted',
+      title: 'Plan Updated via User Interruption',
+      auditSummary: interruptionMessage,
+    });
+
+    res.json({
+      success: true,
+      updatedPlanMarkdown: planMarkdown,
+      phases,
+      tasks,
+      wayForward: `AI updated the plan to incorporate: "${interruptionMessage}". You can now proceed with Phase 1 of the updated plan.`,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Endpoint: Generate Implementation Plan and write IMPLEMENTATION_PLAN.md to disk
 app.post('/api/agent/plan', async (req, res) => {
   const { model, prompt, workspacePath } = req.body;
@@ -1017,7 +1801,7 @@ app.post('/api/agent/plan', async (req, res) => {
   const tree = buildFileTree(targetWorkspace, 0, 2);
   const fileListSnippet = tree.map((t) => (t.isDirectory ? `📁 ${t.name}/` : `📄 ${t.name}`)).join('\n');
 
-  const architectPrompt = `You are the Lead Software Architect of Antigravity IDE.
+  const architectPrompt = `You are the Lead Software Architect of Aria IDE.
 Target workspace directory: ${targetWorkspace}
 Existing files in workspace:
 ${fileListSnippet || '(Empty workspace)'}
@@ -1037,16 +1821,16 @@ Brief architectural overview and technology stack choice.
 
 ### Phase 1: [Phase Title]
 - **Goal:** [What this phase accomplishes]
-- **Target Files:** [Comma-separated file names to create, e.g. index.html, package.json]
-- **Commands:** [Comma-separated commands, if needed, e.g. npm init -y]
+- **Target Files:** [Comma-separated file names with extensions, e.g. package.json, .gitignore. DO NOT list npm package names or library names here, ONLY real filenames to create!]
+- **Commands:** [Comma-separated commands to execute, e.g. npm init -y, npm install express]
 - **Checklist:**
 - [ ] [Specific actionable step]
 - [ ] [Specific actionable step]
 
 ### Phase 2: [Phase Title]
 - **Goal:** [What this phase accomplishes]
-- **Target Files:** [Comma-separated file names to create]
-- **Commands:** [Comma-separated commands]
+- **Target Files:** [Comma-separated file names with extensions, e.g. index.js, calculator.js]
+- **Commands:** [Comma-separated commands, or None]
 - **Checklist:**
 - [ ] [Specific actionable step]
 
@@ -1181,6 +1965,8 @@ app.post('/api/agent/stream', async (req, res) => {
       openTabs = [],
       autoApplyFiles = true,
       autoExecuteCommands = true,
+      targetFiles = [],
+      expectedCommands = [],
       conversationHistory = [],
     } = req.body;
 
@@ -1268,7 +2054,7 @@ ${activeFile.content.slice(0, 10000)}
 \`\`\`\n`;
     }
 
-    let systemInstruction = `You are the Autonomous Software Engineer of the Antigravity IDE.
+    let systemInstruction = `You are the Autonomous Software Engineer of the Aria IDE.
 You are running directly on Linux Ubuntu with full access to the project workspace at:
 ${targetWorkspace}
 
@@ -1291,7 +2077,7 @@ and terminal commands using:
 \`\`\`bash:run
 command to execute
 \`\`\`
-The Antigravity backend will automatically create the files on disk and execute the commands.`;
+The Aria backend will automatically create the files on disk and execute the commands.`;
 
     if (thinkingEnabled) {
       systemInstruction += `\nInclude deep reasoning steps inside <think>...</think> tags before writing your answer.`;
@@ -1451,16 +2237,52 @@ The Antigravity backend will automatically create the files on disk and execute 
           sendEvent('file_error', { path: args.path, error: err.message });
         }
       } else if (fnName === 'run_terminal_command' && args.command && autoExecuteCommands) {
-        sendEvent('command_started', { command: args.command });
-        const resCmd = await runWorkspaceCommand(targetWorkspace, args.command);
-        executedCommands.push({ command: args.command, ...resCmd });
+        let streamCwd = workspaceCwdMap.get(targetWorkspace) || targetWorkspace;
+        sendEvent('command_started', { command: args.command, cwd: streamCwd });
+        const beforeSnap = inspectDirectorySnapshot(streamCwd);
+        const resCmd = await executeCommandLiveStream({
+          command: args.command,
+          cwd: streamCwd,
+          onStdout: (chunk) => sendEvent('command_stdout', { command: args.command, chunk }),
+          onStderr: (chunk) => sendEvent('command_stderr', { command: args.command, chunk }),
+          signal: controller.signal,
+        });
+        sendEvent('command_finished', { command: args.command, exitCode: resCmd.exitCode, success: resCmd.success });
+
+        const afterSnap = inspectDirectorySnapshot(streamCwd);
+        const createdDirs = afterSnap.dirs.filter((d) => !beforeSnap.dirs.includes(d));
+        const createdFiles = afterSnap.files.filter((f) => !beforeSnap.files.includes(f));
+
+        const audit = await auditCommandAndStructure({
+          command: args.command,
+          exitCode: resCmd.exitCode,
+          stdout: resCmd.stdout,
+          stderr: resCmd.stderr,
+          currentCwd: streamCwd,
+          workspacePath: targetWorkspace,
+          createdDirs,
+          createdFiles,
+          model,
+        });
+
+        sendEvent('command_audited', audit);
+        if (audit.newCwd !== streamCwd) {
+          streamCwd = audit.newCwd;
+          workspaceCwdMap.set(targetWorkspace, streamCwd);
+          broadcastToTerminal({ type: 'set_cwd', cwd: streamCwd });
+          sendEvent('cwd_changed', { newCwd: streamCwd, relativeCwd: audit.relativeCwd });
+        }
+
+        executedCommands.push({ command: args.command, ...resCmd, audit });
         appendIdeActivity(targetWorkspace, {
-          type: 'command_executed',
+          type: 'command_audited',
           command: args.command,
           exitCode: resCmd.exitCode,
           success: resCmd.success,
+          auditSummary: audit.summary,
+          newCwd: audit.relativeCwd,
         });
-        sendEvent('command_executed', { command: args.command, ...resCmd });
+        sendEvent('command_executed', { command: args.command, ...resCmd, audit });
       } else if (fnName === 'read_file' && args.path) {
         try {
           const resRead = readWorkspaceFile(targetWorkspace, args.path);
@@ -1474,7 +2296,7 @@ The Antigravity backend will automatically create the files on disk and execute 
 
     // 2. Process markdown / heuristic action blocks from text (Fallback & Multi-format)
     if (autoApplyFiles) {
-      const { fileActions, bashActions } = extractActionsFromText(accumulatedContent);
+      const { fileActions, bashActions } = extractActionsFromText(accumulatedContent, targetFiles);
 
       for (const fa of fileActions) {
         if (!writtenFiles.some((w) => w.relPath === fa.path.replace(/^(\.\/|\/)/, ''))) {
@@ -1498,18 +2320,144 @@ The Antigravity backend will automatically create the files on disk and execute 
       }
 
       if (autoExecuteCommands) {
+        let streamCwd = workspaceCwdMap.get(targetWorkspace) || targetWorkspace;
+
+        // Run any commands extracted from the model's text synchronously one after another
         for (const ba of bashActions) {
           if (!executedCommands.some((c) => c.command === ba.command)) {
-            sendEvent('command_started', { command: ba.command });
-            const resCmd = await runWorkspaceCommand(targetWorkspace, ba.command);
-            executedCommands.push({ command: ba.command, ...resCmd });
+            sendEvent('command_started', { command: ba.command, cwd: streamCwd });
+            const beforeSnap = inspectDirectorySnapshot(streamCwd);
+
+            const resCmd = await executeCommandLiveStream({
+              command: ba.command,
+              cwd: streamCwd,
+              onStdout: (chunk) => sendEvent('command_stdout', { command: ba.command, chunk }),
+              onStderr: (chunk) => sendEvent('command_stderr', { command: ba.command, chunk }),
+              signal: controller.signal,
+            });
+
+            sendEvent('command_finished', { command: ba.command, exitCode: resCmd.exitCode, success: resCmd.success });
+
+            const afterSnap = inspectDirectorySnapshot(streamCwd);
+            const createdDirs = afterSnap.dirs.filter((d) => !beforeSnap.dirs.includes(d));
+            const createdFiles = afterSnap.files.filter((f) => !beforeSnap.files.includes(f));
+
+            const audit = await auditCommandAndStructure({
+              command: ba.command,
+              exitCode: resCmd.exitCode,
+              stdout: resCmd.stdout,
+              stderr: resCmd.stderr,
+              currentCwd: streamCwd,
+              workspacePath: targetWorkspace,
+              createdDirs,
+              createdFiles,
+              model,
+            });
+
+            sendEvent('command_audited', audit);
+            if (audit.newCwd !== streamCwd) {
+              streamCwd = audit.newCwd;
+              workspaceCwdMap.set(targetWorkspace, streamCwd);
+              broadcastToTerminal({ type: 'set_cwd', cwd: streamCwd });
+              sendEvent('cwd_changed', { newCwd: streamCwd, relativeCwd: audit.relativeCwd });
+            }
+
+            executedCommands.push({ command: ba.command, ...resCmd, audit });
             appendIdeActivity(targetWorkspace, {
-              type: 'command_executed',
+              type: 'command_audited',
               command: ba.command,
               exitCode: resCmd.exitCode,
               success: resCmd.success,
+              auditSummary: audit.summary,
+              newCwd: audit.relativeCwd,
             });
-            sendEvent('command_executed', { command: ba.command, ...resCmd });
+            sendEvent('command_executed', { command: ba.command, ...resCmd, audit });
+          }
+        }
+
+        // Run expectedCommands from the phase plan that were not yet executed
+        if (Array.isArray(expectedCommands)) {
+          for (const ec of expectedCommands) {
+            const cleanCmd = ec.trim().replace(/^[$#]\s*/, '');
+            if (cleanCmd && !executedCommands.some((c) => c.command === cleanCmd)) {
+              sendEvent('command_started', { command: cleanCmd, cwd: streamCwd });
+              const beforeSnap = inspectDirectorySnapshot(streamCwd);
+
+              const resCmd = await executeCommandLiveStream({
+                command: cleanCmd,
+                cwd: streamCwd,
+                onStdout: (chunk) => sendEvent('command_stdout', { command: cleanCmd, chunk }),
+                onStderr: (chunk) => sendEvent('command_stderr', { command: cleanCmd, chunk }),
+                signal: controller.signal,
+              });
+
+              sendEvent('command_finished', { command: cleanCmd, exitCode: resCmd.exitCode, success: resCmd.success });
+
+              const afterSnap = inspectDirectorySnapshot(streamCwd);
+              const createdDirs = afterSnap.dirs.filter((d) => !beforeSnap.dirs.includes(d));
+              const createdFiles = afterSnap.files.filter((f) => !beforeSnap.files.includes(f));
+
+              const audit = await auditCommandAndStructure({
+                command: cleanCmd,
+                exitCode: resCmd.exitCode,
+                stdout: resCmd.stdout,
+                stderr: resCmd.stderr,
+                currentCwd: streamCwd,
+                workspacePath: targetWorkspace,
+                createdDirs,
+                createdFiles,
+                model,
+              });
+
+              sendEvent('command_audited', audit);
+              if (audit.newCwd !== streamCwd) {
+                streamCwd = audit.newCwd;
+                workspaceCwdMap.set(targetWorkspace, streamCwd);
+                broadcastToTerminal({ type: 'set_cwd', cwd: streamCwd });
+                sendEvent('cwd_changed', { newCwd: streamCwd, relativeCwd: audit.relativeCwd });
+              }
+
+              executedCommands.push({ command: cleanCmd, ...resCmd, audit });
+              appendIdeActivity(targetWorkspace, {
+                type: 'command_audited',
+                command: cleanCmd,
+                exitCode: resCmd.exitCode,
+                success: resCmd.success,
+                auditSummary: audit.summary,
+                newCwd: audit.relativeCwd,
+              });
+              sendEvent('command_executed', { command: cleanCmd, ...resCmd, audit });
+            }
+          }
+        }
+      }
+
+      // Check if targetFiles were created on disk by commands (e.g. npm init creating package.json)
+      if (Array.isArray(targetFiles)) {
+        for (const tf of targetFiles) {
+          const cleanTf = tf.replace(/^['"`]+|['"`]+$/g, '').replace(/^(\.\/|\/)/, '').trim();
+          if (!cleanTf) continue;
+          const targetAbs = path.resolve(targetWorkspace, cleanTf);
+          if (fs.existsSync(targetAbs) && !writtenFiles.some((w) => w.relPath === cleanTf)) {
+            try {
+              const stat = fs.statSync(targetAbs);
+              if (!stat.isDirectory()) {
+                const content = fs.readFileSync(targetAbs, 'utf8');
+                const fileInfo = {
+                  absPath: targetAbs,
+                  relPath: cleanTf,
+                  size: stat.size,
+                  originalContent: '',
+                  isNewFile: true,
+                  content,
+                };
+                writtenFiles.push(fileInfo);
+                sendEvent('file_written', {
+                  ...fileInfo,
+                  source: 'disk_sync',
+                });
+              }
+            } catch (e) {}
           }
         }
       }
@@ -1536,6 +2484,6 @@ The Antigravity backend will automatically create the files on disk and execute 
 });
 
 server.listen(PORT, () => {
-  console.log(`[Antigravity IDE Backend] Listening on http://localhost:${PORT}`);
-  console.log(`[Antigravity IDE Backend] WebSocket Terminal ready on ws://localhost:${PORT}`);
+  console.log(`[Aria IDE Backend] Listening on http://localhost:${PORT}`);
+  console.log(`[Aria IDE Backend] WebSocket Terminal ready on ws://localhost:${PORT}`);
 });

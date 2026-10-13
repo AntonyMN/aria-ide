@@ -1,6 +1,6 @@
 import React from 'react';
 import type { LocalModel, SystemMemory } from '../types';
-import { Cpu, HardDrive, Check, AlertTriangle, ShieldCheck, Zap, X } from 'lucide-react';
+import { Cpu, Check, Zap, X } from 'lucide-react';
 
 interface Props {
   isOpen: boolean;

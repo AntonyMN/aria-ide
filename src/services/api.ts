@@ -1,4 +1,4 @@
-import type { LocalModel, SystemMemory, FileNode, ExecutionPhase, PlanTask, WorkspaceSession, ActivityLogItem } from '../types';
+import type { LocalModel, SystemMemory, FileNode, ExecutionPhase, PlanTask, WorkspaceSession, ActivityLogItem, CommandAuditResult } from '../types';
 
 const API_BASE = 'http://localhost:3001/api';
 
@@ -246,6 +246,155 @@ export async function createDirectory(parentPath: string, folderName: string): P
   });
   if (!res.ok) throw new Error('Failed to create folder');
   return res.json();
+}
+
+export async function auditCommand(params: {
+  command: string;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  currentCwd: string;
+  workspacePath: string;
+  createdDirs?: string[];
+  createdFiles?: string[];
+  model?: string;
+  goalContext?: string;
+}): Promise<CommandAuditResult> {
+  const res = await fetch(`${API_BASE}/agent/audit-command`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+  if (!res.ok) throw new Error('Failed to audit command execution');
+  return res.json();
+}
+
+export async function interruptAgent(params: {
+  model: string;
+  workspacePath: string;
+  currentCwd: string;
+  interruptionMessage: string;
+  activePlan?: any;
+  completedPhases?: any[];
+  executedCommands?: any[];
+  writtenFiles?: any[];
+}): Promise<{
+  success: boolean;
+  updatedPlanMarkdown: string;
+  phases: ExecutionPhase[];
+  tasks: PlanTask[];
+  wayForward: string;
+}> {
+  const res = await fetch(`${API_BASE}/agent/interrupt`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(err || 'Failed to process interruption');
+  }
+  return res.json();
+}
+
+export interface LiveStreamCallbacks {
+  onQueueStarted?: (data: { total: number; commands: string[]; currentCwd: string }) => void;
+  onCommandStarted?: (data: { index: number; command: string; cwd: string }) => void;
+  onStdout?: (data: { index: number; chunk: string }) => void;
+  onStderr?: (data: { index: number; chunk: string }) => void;
+  onCommandFinished?: (data: { index: number; exitCode: number; success: boolean }) => void;
+  onCommandAudited?: (data: { index: number; audit: CommandAuditResult }) => void;
+  onCwdChanged?: (data: { newCwd: string; relativeCwd: string }) => void;
+  onInterrupted?: (data: { index: number; reason: string }) => void;
+  onError?: (err: string) => void;
+  onQueueCompleted?: (data: { completed: boolean; finalCwd: string; results: any[] }) => void;
+}
+
+export async function streamSequentialCommandsLive(
+  params: {
+    commands: string[];
+    workspacePath: string;
+    initialCwd?: string;
+    model?: string;
+    goalContext?: string;
+  },
+  callbacks: LiveStreamCallbacks,
+  signal?: AbortSignal
+): Promise<void> {
+  const res = await fetch(`${API_BASE}/terminal/run-live-stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    signal,
+    body: JSON.stringify(params),
+  });
+
+  if (!res.body) throw new Error('No streaming response body from command runner');
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    if (signal?.aborted) break;
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const events = buffer.split('\n\n');
+    buffer = events.pop() || '';
+
+    for (const ev of events) {
+      if (!ev.trim()) continue;
+      const lines = ev.split('\n');
+      let eventType = 'message';
+      let dataStr = '';
+
+      for (const line of lines) {
+        if (line.startsWith('event: ')) eventType = line.substring(7);
+        if (line.startsWith('data: ')) dataStr = line.substring(6);
+      }
+
+      if (!dataStr) continue;
+
+      try {
+        const parsed = JSON.parse(dataStr);
+        switch (eventType) {
+          case 'queue_started':
+            callbacks.onQueueStarted?.(parsed);
+            break;
+          case 'command_started':
+            callbacks.onCommandStarted?.(parsed);
+            break;
+          case 'command_stdout':
+            callbacks.onStdout?.(parsed);
+            break;
+          case 'command_stderr':
+            callbacks.onStderr?.(parsed);
+            break;
+          case 'command_finished':
+            callbacks.onCommandFinished?.(parsed);
+            break;
+          case 'command_audited':
+            callbacks.onCommandAudited?.(parsed);
+            break;
+          case 'cwd_changed':
+            callbacks.onCwdChanged?.(parsed);
+            break;
+          case 'interrupted':
+            callbacks.onInterrupted?.(parsed);
+            break;
+          case 'queue_completed':
+            callbacks.onQueueCompleted?.(parsed);
+            break;
+          case 'error':
+            callbacks.onError?.(parsed.error);
+            break;
+        }
+      } catch (e) {
+        console.error('Failed to parse SSE event:', e);
+      }
+    }
+  }
 }
 
 

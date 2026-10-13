@@ -12,7 +12,6 @@ import {
   ChevronDown,
   Plus,
   Trash2,
-  Edit2,
   RefreshCw,
 } from 'lucide-react';
 

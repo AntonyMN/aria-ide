@@ -7,9 +7,9 @@ import type {
   OpenTab,
   DiffProposal,
   PlanTask,
-  ExecutionPhase,
   ActivePlanExecution,
   ChatMessage,
+  LiveCommandQueueItem,
 } from './types';
 import {
   fetchModels,
@@ -25,7 +25,8 @@ import {
   verifyWorkspaceFiles,
   fetchWorkspaceSession,
   saveWorkspaceSession,
-  fetchWorkspaceActivity,
+  interruptAgent,
+  streamSequentialCommandsLive,
 } from './services/api';
 import { FileTree } from './components/FileTree';
 import { ModelSelectorModal } from './components/ModelSelectorModal';
@@ -34,6 +35,7 @@ import { DiffReviewModal } from './components/DiffReviewModal';
 import { PlanDrawer } from './components/PlanDrawer';
 import { AgentChatPane } from './components/AgentChatPane';
 import { WorkspacePickerModal } from './components/WorkspacePickerModal';
+import { OnScreenCommandRunner } from './components/OnScreenCommandRunner';
 import {
   confirmStopGeneration,
   promptText,
@@ -48,10 +50,9 @@ import {
   Save,
   Terminal as TerminalIcon,
   ListTodo,
-  Layers,
-  Sparkles,
   X,
   Code2,
+  Zap,
 } from 'lucide-react';
 
 export function App() {
@@ -65,6 +66,9 @@ export function App() {
   const [workspacePath, setWorkspacePath] = useState<string>(() => {
     return localStorage.getItem('ide_active_workspace') || '/home/anto/builds/ide';
   });
+  const [currentCwd, setCurrentCwd] = useState<string>(() => {
+    return localStorage.getItem('ide_active_cwd') || localStorage.getItem('ide_active_workspace') || '/home/anto/builds/ide';
+  });
   const [isWorkspaceModalOpen, setIsWorkspaceModalOpen] = useState(true);
   const [fileTree, setFileTree] = useState<FileNode[]>([]);
   const [activeFilePath, setActiveFilePath] = useState<string>('');
@@ -76,8 +80,14 @@ export function App() {
   const [tabs, setTabs] = useState<OpenTab[]>([]);
   const [activeTabId, setActiveTabId] = useState<string>('');
 
-  // Bottom Dock State
-  const [activeDockTab, setActiveDockTab] = useState<'terminal' | 'plan'>('terminal');
+  // Bottom Dock State (supports interactive xterm terminal, on-screen live command runner, and implementation plan)
+  const [activeDockTab, setActiveDockTab] = useState<'terminal' | 'runner' | 'plan'>('terminal');
+
+  // Live On-Screen Command Queue State
+  const [liveQueue, setLiveQueue] = useState<LiveCommandQueueItem[]>([]);
+  const [currentQueueIndex, setCurrentQueueIndex] = useState<number>(0);
+  const [isQueueRunning, setIsQueueRunning] = useState<boolean>(false);
+  const [isQueuePaused, setIsQueuePaused] = useState<boolean>(false);
 
   // Diff Review State
   const [activeDiff, setActiveDiff] = useState<DiffProposal | null>(null);
@@ -585,6 +595,205 @@ export function App() {
     showSuccessToast('AI generation stopped');
   };
 
+  // Interrupt Generation or on-screen execution with updated instructions
+  const handleInterrupt = async (updateMessage?: string) => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    await stopAgentGeneration();
+    setIsStreaming(false);
+    setIsQueueRunning(false);
+    setIsQueuePaused(true);
+
+    if (!updateMessage?.trim()) {
+      setActivePlan((prev) => (prev ? { ...prev, status: 'interrupted' } : null));
+      showSuccessToast('System paused. Type instructions to guide the AI.');
+      return;
+    }
+
+    showSuccessToast('Updating AI plan with your instructions...');
+
+    const interruptMsgId = `interrupt-${Date.now()}`;
+    const reviseAsstMsgId = `asst-revised-${Date.now()}`;
+
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: interruptMsgId,
+        role: 'user',
+        content: `⏸️ **[Interruption & Guidance]**\n${updateMessage}`,
+        timestamp: Date.now(),
+        isInterruption: true,
+      },
+      {
+        id: reviseAsstMsgId,
+        role: 'assistant',
+        content: '🔄 **Auditing interruption and updating plan with new instructions...**',
+        timestamp: Date.now(),
+        isStreaming: true,
+      },
+    ]);
+
+    try {
+      const revised = await interruptAgent({
+        model: selectedModel,
+        workspacePath,
+        currentCwd,
+        interruptionMessage: updateMessage,
+        activePlan,
+        completedPhases: activePlan?.phases.slice(0, activePlan.currentPhaseIndex),
+      });
+
+      if (revised.phases && revised.phases.length > 0) {
+        const updatedPlanState: ActivePlanExecution = {
+          prompt: activePlan?.prompt || updateMessage,
+          phases: revised.phases,
+          currentPhaseIndex: 0,
+          status: 'paused',
+          currentCwd,
+          lastInterruption: {
+            message: updateMessage,
+            timestamp: Date.now(),
+          },
+        };
+
+        setActivePlan(updatedPlanState);
+        setPlanTasks(revised.tasks || []);
+
+        // Open updated plan on Monaco
+        await loadWorkspace();
+        const planFileAbs = `${workspacePath}/IMPLEMENTATION_PLAN.md`;
+        await handleSelectFile(planFileAbs, revised.updatedPlanMarkdown);
+
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === reviseAsstMsgId
+              ? {
+                  ...m,
+                  content: `🔄 **AI has updated the plan based on your guidance!**\n\n*Updated requirements:* "${updateMessage}"\n\n${revised.updatedPlanMarkdown}\n\n---\n*System is paused. Click **Proceed to Phase 1** or type 'proceed' to execute the updated plan.*`,
+                  isStreaming: false,
+                }
+              : m
+          )
+        );
+
+        showSuccessToast('Plan updated with your new instructions!');
+      }
+    } catch (err: any) {
+      showErrorAlert('Interruption Error', err.message || 'Failed to update plan');
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === reviseAsstMsgId
+            ? {
+                ...m,
+                content: `⚠️ Failed to update plan automatically: ${err.message}`,
+                isStreaming: false,
+              }
+            : m
+        )
+      );
+    }
+  };
+
+  // Sequentially execute an array of bash commands live on screen
+  const handleRunCommandsOnScreen = async (commands: string[], initialCwd?: string) => {
+    if (!commands || commands.length === 0) return;
+    setActiveDockTab('runner');
+    setBottomDockHeight((prev) => Math.max(prev, 280));
+    setIsQueueRunning(true);
+    setIsQueuePaused(false);
+
+    const targetCwd = initialCwd || currentCwd;
+    const items: LiveCommandQueueItem[] = commands.map((cmd, idx) => ({
+      id: `cmd-${Date.now()}-${idx}`,
+      command: cmd,
+      status: idx === 0 ? 'running' : 'pending',
+      cwd: targetCwd,
+      stdout: '',
+      stderr: '',
+    }));
+
+    setLiveQueue(items);
+    setCurrentQueueIndex(0);
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
+    try {
+      await streamSequentialCommandsLive(
+        {
+          commands,
+          workspacePath,
+          initialCwd: targetCwd,
+          model: selectedModel,
+        },
+        {
+          onStdout: (data) => {
+            setLiveQueue((prev) =>
+              prev.map((it, idx) =>
+                idx === data.index
+                  ? { ...it, stdout: it.stdout + data.chunk }
+                  : it
+              )
+            );
+          },
+          onStderr: (data) => {
+            setLiveQueue((prev) =>
+              prev.map((it, idx) =>
+                idx === data.index
+                  ? { ...it, stderr: it.stderr + data.chunk }
+                  : it
+              )
+            );
+          },
+          onCommandFinished: (data) => {
+            setLiveQueue((prev) =>
+              prev.map((it, idx) => {
+                if (idx === data.index) {
+                  return {
+                    ...it,
+                    status: data.success ? 'completed' : 'error',
+                    exitCode: data.exitCode,
+                  };
+                }
+                if (idx === data.index + 1 && it.status === 'pending') {
+                  return { ...it, status: 'running' };
+                }
+                return it;
+              })
+            );
+            setCurrentQueueIndex((prev) => Math.min(prev + 1, commands.length - 1));
+          },
+          onCommandAudited: (data) => {
+            setLiveQueue((prev) =>
+              prev.map((it, idx) => (idx === data.index ? { ...it, audit: data.audit } : it))
+            );
+            if (data.audit.relativeCwd && data.audit.relativeCwd !== '.') {
+              showSuccessToast(`CWD shifted into ./${data.audit.relativeCwd}`);
+            }
+          },
+          onCwdChanged: (data) => {
+            setCurrentCwd(data.newCwd);
+            localStorage.setItem('ide_active_cwd', data.newCwd);
+            loadWorkspace();
+          },
+          onQueueCompleted: () => {
+            setIsQueueRunning(false);
+            loadWorkspace();
+          },
+        },
+        controller.signal
+      );
+    } catch (err: any) {
+      if (err.name !== 'AbortError') {
+        showErrorAlert('Command Queue Error', err.message);
+      }
+    } finally {
+      setIsQueueRunning(false);
+    }
+  };
+
   // Keyboard shortcut: Escape key triggers stop generation prompt
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -604,6 +813,8 @@ export function App() {
       thinkingEnabled: boolean;
       autoApplyFiles?: boolean;
       autoExecuteCommands?: boolean;
+      targetFiles?: string[];
+      expectedCommands?: string[];
       onFileWritten?: (file: { path: string; fullPath: string; size: number }) => void;
       onCommandExecuted?: (cmd: { command: string; success: boolean; exitCode: number; stdout: string; stderr: string; hasError: boolean }) => void;
     }
@@ -625,6 +836,9 @@ export function App() {
         workspacePath,
         thinkingEnabled: options.thinkingEnabled,
         autoApplyFiles: options.autoApplyFiles ?? true,
+        autoExecuteCommands: options.autoExecuteCommands ?? true,
+        targetFiles: options.targetFiles || [],
+        expectedCommands: options.expectedCommands || [],
         activeFile: activeTab ? { path: activeTab.path, content: activeTab.content } : undefined,
         openTabs: tabs.map((t) => ({ path: t.path, name: t.name })),
         conversationHistory: messages.map((m) => ({
@@ -689,11 +903,83 @@ export function App() {
             writtenFiles.push(f);
             options.onFileWritten?.(f);
           } catch (e) {}
+        } else if (eventType === 'command_started' && dataStr) {
+          try {
+            const cs = JSON.parse(dataStr);
+            setActiveDockTab('runner');
+            setBottomDockHeight((prev) => Math.max(prev, 280));
+            setIsQueueRunning(true);
+            setIsQueuePaused(false);
+            setLiveQueue((prev) => {
+              const itemExists = prev.find((p) => p.command === cs.command && p.status === 'running');
+              if (itemExists) return prev;
+              return [
+                ...prev,
+                {
+                  id: `cmd-${Date.now()}`,
+                  command: cs.command,
+                  status: 'running',
+                  cwd: cs.cwd || currentCwd,
+                  stdout: '',
+                  stderr: '',
+                },
+              ];
+            });
+          } catch (e) {}
+        } else if (eventType === 'command_stdout' && dataStr) {
+          try {
+            const co = JSON.parse(dataStr);
+            setLiveQueue((prev) =>
+              prev.map((item) =>
+                item.command === co.command && item.status === 'running'
+                  ? { ...item, stdout: item.stdout + co.chunk }
+                  : item
+              )
+            );
+          } catch (e) {}
+        } else if (eventType === 'command_stderr' && dataStr) {
+          try {
+            const ce = JSON.parse(dataStr);
+            setLiveQueue((prev) =>
+              prev.map((item) =>
+                item.command === ce.command && item.status === 'running'
+                  ? { ...item, stderr: item.stderr + ce.chunk }
+                  : item
+              )
+            );
+          } catch (e) {}
+        } else if (eventType === 'command_audited' && dataStr) {
+          try {
+            const ca = JSON.parse(dataStr);
+            setLiveQueue((prev) =>
+              prev.map((item) =>
+                item.command === ca.command
+                  ? { ...item, audit: ca, status: ca.success ? 'completed' : 'error' }
+                  : item
+              )
+            );
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === targetMsgId
+                  ? { ...m, commandAudit: ca }
+                  : m
+              )
+            );
+          } catch (e) {}
+        } else if (eventType === 'cwd_changed' && dataStr) {
+          try {
+            const cd = JSON.parse(dataStr);
+            setCurrentCwd(cd.newCwd);
+            localStorage.setItem('ide_active_cwd', cd.newCwd);
+            loadWorkspace();
+            showSuccessToast(`CWD shifted to ./${cd.relativeCwd}`);
+          } catch (e) {}
         } else if (eventType === 'command_executed' && dataStr) {
           try {
             const c = JSON.parse(dataStr);
             executedCommands.push(c);
             options.onCommandExecuted?.(c);
+            setIsQueueRunning(false);
           } catch (e) {}
         } else if (eventType === 'done' && dataStr) {
           try {
@@ -765,35 +1051,37 @@ export function App() {
       },
     ]);
 
-    const phasePrompt = `We are executing Phase ${phase.number} of ${plan.phases.length} for: "${plan.prompt}".
-PHASE TITLE: ${phase.title}
+    const phasePrompt = `You are executing Phase ${phase.number}/${plan.phases.length}: "${phase.title}" for: "${plan.prompt}".
 
-GOAL & SPECIFICATIONS:
+OBJECTIVE & DETAILS:
 ${phase.description}
 
-TARGET FILES TO CREATE OR UPDATE:
-${phase.targetFiles.length > 0 ? phase.targetFiles.map((f) => `- ${f}`).join('\n') : 'Create or update necessary files'}
+TARGET FILES TO CREATE:
+${phase.targetFiles.length > 0 ? phase.targetFiles.map((f) => `- ${f}`).join('\n') : 'Create necessary project files'}
 
 COMMANDS TO RUN:
-${phase.commands.length > 0 ? phase.commands.map((c) => `- ${c}`).join('\n') : 'None or run setup/build commands'}
+${phase.commands.length > 0 ? phase.commands.map((c) => `- ${c}`).join('\n') : 'None'}
 
-CRITICAL INSTRUCTIONS:
-- Write the complete code for all files needed for this phase.
-- Use explicit markdown code blocks:
-\`\`\`file:relative/path/to/file.ext
-[full complete code here]
+MANDATORY INSTRUCTIONS:
+1. Provide the complete code for EVERY target file. Do NOT write placeholders, summaries, or omissions.
+2. Put the code for each file inside a markdown code block:
+\`\`\`file:path/to/file.ext
+[complete code here]
 \`\`\`
-- Or call the native write_file tool.
-- If commands are needed, use:
-\`\`\`bash:run
+3. If terminal commands are needed (e.g. npm init, npm install), provide them inside:
+\`\`\`bash
 command to execute
 \`\`\`
-- Or call the native run_terminal_command tool.
-- Antigravity IDE will automatically write files to disk, sync Monaco Editor, and execute commands.`;
+4. The system will automatically execute all commands and write all files directly to disk.
+Write the complete code for the files now:`;
 
     try {
       const phaseResult = await streamAgentTask(phasePrompt, phaseMsgId, {
         thinkingEnabled,
+        targetFiles: phase.targetFiles,
+        expectedCommands: phase.commands,
+        autoExecuteCommands: true,
+        autoApplyFiles: true,
         onFileWritten: (file) => {
           loadWorkspace();
           handleSelectFile(file.fullPath);
@@ -802,9 +1090,74 @@ command to execute
         onCommandExecuted: async (cmd) => {
           if (cmd.hasError) {
             showWarningAlert('Command Error', `Command "${cmd.command}" failed.`);
+          } else {
+            showSuccessToast(`Ran: ${cmd.command}`);
           }
         },
       });
+
+      // Autonomous Targeted Fallback: verify every planned targetFile was created/written
+      if (!abortControllerRef.current?.signal.aborted) {
+        const writtenRelPaths = new Set(
+          phaseResult.writtenFiles.map((w) => w.path.replace(/^(\.\/|\/)/, '').toLowerCase())
+        );
+
+        const missingFiles = phase.targetFiles.filter((tf) => {
+          const clean = tf.replace(/^(\.\/|\/)/, '').trim().toLowerCase();
+          return !writtenRelPaths.has(clean) && !Array.from(writtenRelPaths).some((wp) => wp.endsWith('/' + clean));
+        });
+
+        if (missingFiles.length > 0) {
+          for (const missingFile of missingFiles) {
+            if (abortControllerRef.current?.signal.aborted) break;
+            const fallbackMsgId = `fallback-${Date.now()}-${missingFile.replace(/[^a-zA-Z0-9]/g, '_')}`;
+
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: fallbackMsgId,
+                role: 'assistant',
+                content: `✍️ **Generating missing target file:** \`${missingFile}\`...`,
+                thinking: '',
+                isStreaming: true,
+                timestamp: Date.now(),
+              },
+            ]);
+
+            const singleFilePrompt = `You are implementing Phase ${phase.number} (${phase.title}) of "${plan.prompt}".
+Generate the complete, working production code for the file: "${missingFile}".
+Do NOT write conversational filler or instructions.
+Output ONLY the file code inside:
+\`\`\`file:${missingFile}
+[complete code here]
+\`\`\``;
+
+            try {
+              const fallbackRes = await streamAgentTask(singleFilePrompt, fallbackMsgId, {
+                thinkingEnabled: false,
+                targetFiles: [missingFile],
+                autoApplyFiles: true,
+                autoExecuteCommands: false,
+                onFileWritten: (file) => {
+                  loadWorkspace();
+                  handleSelectFile(file.fullPath);
+                  showSuccessToast(`Created ${file.path}`);
+                },
+              });
+
+              if (fallbackRes.writtenFiles.length > 0) {
+                for (const wf of fallbackRes.writtenFiles) {
+                  if (!phaseResult.writtenFiles.some((p) => p.path === wf.path)) {
+                    phaseResult.writtenFiles.push(wf);
+                  }
+                }
+              }
+            } catch (fbErr) {
+              console.warn(`Fallback generation for ${missingFile} failed:`, fbErr);
+            }
+          }
+        }
+      }
 
       // Mark checklist tasks completed for this phase
       setPlanTasks((prev) =>
@@ -899,8 +1252,8 @@ command to execute
       return;
     }
 
-    // Check if system is currently paused after a phase and user inputs confirmation
-    if (activePlan && activePlan.status === 'paused') {
+    // Check if system is currently paused or interrupted and user inputs input
+    if (activePlan && (activePlan.status === 'paused' || activePlan.status === 'interrupted')) {
       const trimmed = prompt.trim();
       if (/^(proceed|continue|next|go|yes|run|ok|start)\b/i.test(trimmed)) {
         const userMsg: ChatMessage = {
@@ -911,6 +1264,10 @@ command to execute
         };
         setMessages((prev) => [...prev, userMsg]);
         await handleProceedNextPhase();
+        return;
+      } else {
+        // User typed new information/requirements while paused!
+        await handleInterrupt(prompt);
         return;
       }
     }
@@ -946,10 +1303,19 @@ command to execute
 
         await streamAgentTask(prompt, assistantMsgId, {
           thinkingEnabled: options.thinkingEnabled,
+          autoApplyFiles: true,
+          autoExecuteCommands: true,
           onFileWritten: (file) => {
             loadWorkspace();
             handleSelectFile(file.fullPath);
             showSuccessToast(`Created ${file.path}`);
+          },
+          onCommandExecuted: (cmd) => {
+            if (cmd.hasError) {
+              showWarningAlert('Command Error', `Command "${cmd.command}" failed.`);
+            } else {
+              showSuccessToast(`Ran: ${cmd.command}`);
+            }
           },
         });
 
@@ -1044,7 +1410,7 @@ command to execute
             <div className="ide-logo-icon">
               <Code2 size={16} />
             </div>
-            <span className="brand-gradient">ANTIGRAVITY IDE</span>
+            <span className="brand-gradient">ARIA IDE</span>
           </div>
 
           {/* Model Pill Button */}
@@ -1222,10 +1588,24 @@ command to execute
             title="Drag to resize Bottom panel. Double-click to reset (240px)"
           />
 
-          {/* Bottom Dock (Terminal / Implementation Plan) */}
+          {/* Bottom Dock (Live Runner / Terminal / Implementation Plan) */}
           <div className="bottom-dock" style={{ height: `${bottomDockHeight}px` }}>
             <div className="dock-header">
               <div className="dock-tabs">
+                <button
+                  className={`dock-tab ${activeDockTab === 'runner' ? 'active' : ''}`}
+                  onClick={() => setActiveDockTab('runner')}
+                >
+                  <Zap
+                    size={12}
+                    style={{
+                      display: 'inline',
+                      marginRight: 4,
+                      color: isQueueRunning ? 'var(--accent-cyan)' : undefined,
+                    }}
+                  />
+                  Live Command Runner {isQueueRunning ? '(Running...)' : liveQueue.length > 0 ? `(${liveQueue.length})` : ''}
+                </button>
                 <button
                   className={`dock-tab ${activeDockTab === 'terminal' ? 'active' : ''}`}
                   onClick={() => setActiveDockTab('terminal')}
@@ -1244,8 +1624,30 @@ command to execute
             </div>
 
             <div style={{ flex: 1, overflow: 'hidden' }}>
-              {activeDockTab === 'terminal' ? (
-                <TerminalPane currentCwd={workspacePath} />
+              {activeDockTab === 'runner' ? (
+                <OnScreenCommandRunner
+                  queue={liveQueue}
+                  currentIndex={currentQueueIndex}
+                  isRunning={isQueueRunning}
+                  isPaused={isQueuePaused}
+                  currentCwd={currentCwd}
+                  workspacePath={workspacePath}
+                  onInterrupt={(msg) => handleInterrupt(msg)}
+                  onResume={() => {
+                    setIsQueuePaused(false);
+                    setIsQueueRunning(true);
+                  }}
+                  onSkip={() => {
+                    if (currentQueueIndex + 1 < liveQueue.length) {
+                      setCurrentQueueIndex((prev) => prev + 1);
+                    } else {
+                      setIsQueueRunning(false);
+                    }
+                  }}
+                  onRunCustomCommand={(cmd) => handleRunCommandsOnScreen([cmd])}
+                />
+              ) : activeDockTab === 'terminal' ? (
+                <TerminalPane currentCwd={currentCwd} />
               ) : (
                 <PlanDrawer
                   plan={planTasks}
@@ -1282,10 +1684,12 @@ command to execute
           messages={messages}
           onSendMessage={handleSendMessage}
           onStopGeneration={handleStopGeneration}
+          onInterrupt={handleInterrupt}
           selectedModel={selectedModel}
           isStreaming={isStreaming}
           onOpenDiffReview={(diff) => setActiveDiff(diff)}
           workspacePath={workspacePath}
+          currentCwd={currentCwd}
           onApplyPlan={(newPlan) => setPlanTasks(newPlan)}
           onFileSavedOrCreated={(createdPath) => {
             loadWorkspace();
@@ -1297,6 +1701,11 @@ command to execute
           activePlan={activePlan}
           onProceedNextPhase={handleProceedNextPhase}
           onSkipPhase={handleSkipPhase}
+          onRunCommands={handleRunCommandsOnScreen}
+          onOpenLiveRunner={() => {
+            setActiveDockTab('runner');
+            setBottomDockHeight((prev) => Math.max(prev, 280));
+          }}
           width={rightSidebarWidth}
         />
       </div>
@@ -1318,7 +1727,7 @@ command to execute
         <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
           <span>UTF-8</span>
           <span>{activeTab ? activeTab.language : 'Plain Text'}</span>
-          <span>Antigravity IDE v0.1</span>
+          <span>Aria IDE v0.1</span>
         </div>
       </footer>
 

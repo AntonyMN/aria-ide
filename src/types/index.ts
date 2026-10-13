@@ -77,13 +77,44 @@ export interface ExecutionPhase {
   error?: string;
 }
 
+export interface CommandAuditResult {
+  command: string;
+  exitCode: number;
+  success: boolean;
+  stdout: string;
+  stderr: string;
+  oldCwd: string;
+  newCwd: string;
+  relativeCwd: string;
+  createdDirs: string[];
+  createdFiles: string[];
+  status: 'success' | 'warning' | 'error';
+  summary: string;
+  wayForward: string;
+  suggestedNextCommands: string[];
+}
+
+export interface LiveCommandQueueItem {
+  id: string;
+  command: string;
+  status: 'pending' | 'running' | 'completed' | 'error' | 'interrupted' | 'skipped';
+  cwd: string;
+  stdout: string;
+  stderr: string;
+  exitCode?: number;
+  audit?: CommandAuditResult;
+  startTime?: number;
+  endTime?: number;
+}
+
 export interface ToolExecution {
   id: string;
-  tool: 'read_file' | 'write_file' | 'terminal_command' | 'list_directory';
+  tool: 'read_file' | 'write_file' | 'terminal_command' | 'list_directory' | 'audit_command';
   args: Record<string, any>;
   status: 'running' | 'success' | 'error';
   output?: string;
   error?: string;
+  audit?: CommandAuditResult;
 }
 
 export interface ChatMessage {
@@ -96,12 +127,14 @@ export interface ChatMessage {
   diffs?: DiffProposal[];
   plan?: PlanTask[];
   timestamp: number;
+  commandAudit?: CommandAuditResult;
+  isInterruption?: boolean;
 }
 
 export interface ActivityLogItem {
   id: string;
   timestamp: string;
-  type: 'file_written' | 'command_executed' | 'plan_generated' | 'phase_completed' | 'file_read';
+  type: 'file_written' | 'command_executed' | 'command_audited' | 'plan_generated' | 'phase_completed' | 'file_read' | 'interrupted';
   path?: string;
   size?: number;
   command?: string;
@@ -109,20 +142,28 @@ export interface ActivityLogItem {
   success?: boolean;
   phaseNumber?: number;
   title?: string;
+  auditSummary?: string;
+  newCwd?: string;
 }
 
 export interface ActivePlanExecution {
   prompt: string;
   phases: ExecutionPhase[];
   currentPhaseIndex: number;
-  status: 'idle' | 'executing' | 'paused' | 'completed' | 'error';
+  status: 'idle' | 'executing' | 'paused' | 'interrupted' | 'completed' | 'error';
   autoProceed?: boolean;
+  currentCwd?: string;
+  lastInterruption?: {
+    message: string;
+    timestamp: number;
+  };
 }
 
 export interface WorkspaceSession {
   version?: string;
   updatedAt?: string;
   workspacePath?: string;
+  currentCwd?: string;
   selectedModel?: string;
   activeFilePath?: string;
   openTabs?: { path: string; name: string }[];

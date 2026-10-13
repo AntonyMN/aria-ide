@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Aria IDE - Free Local AI-Powered Autonomous Development Environment</title>
+  <meta name="description" content="Aria IDE allows developers to build software autonomously using free, self-hosted LLMs running privately on their laptops.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #07090e;
+      --card-bg: rgba(15, 23, 42, 0.75);
+      --border: rgba(255, 255, 255, 0.1);
+      --cyan: #00f0ff;
+      --purple: #a855f7;
+      --emerald: #10b981;
+      --amber: #f59e0b;
+      --text: #f8fafc;
+      --text-dim: #94a3b8;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Inter', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      overflow-x: hidden;
+    }
+    .hero-glow {
+      position: absolute;
+      top: -150px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 800px;
+      height: 400px;
+      background: radial-gradient(circle, rgba(0, 240, 255, 0.15) 0%, rgba(168, 85, 247, 0.1) 40%, transparent 70%);
+      pointer-events: none;
+      z-index: 0;
+    }
+    header {
+      position: relative;
+      z-index: 10;
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 24px 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid var(--border);
+    }
+    .logo {
+      font-size: 1.4rem;
+      font-weight: 800;
+      letter-spacing: -0.5px;
+      background: linear-gradient(135deg, #00f0ff 0%, #a855f7 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .nav-links a {
+      color: var(--text-dim);
+      text-decoration: none;
+      font-size: 0.95rem;
+      margin-left: 20px;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--cyan); }
+    .hero {
+      position: relative;
+      z-index: 10;
+      max-width: 900px;
+      margin: 80px auto 40px auto;
+      text-align: center;
+      padding: 0 20px;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 14px;
+      border-radius: 9999px;
+      background: rgba(0, 240, 255, 0.1);
+      border: 1px solid rgba(0, 240, 255, 0.3);
+      color: var(--cyan);
+      font-size: 0.85rem;
+      font-weight: 600;
+      margin-bottom: 24px;
+    }
+    h1 {
+      font-size: 3.4rem;
+      font-weight: 800;
+      letter-spacing: -1.5px;
+      line-height: 1.15;
+      margin-bottom: 20px;
+    }
+    .gradient-text {
+      background: linear-gradient(135deg, #00f0ff 0%, #38bdf8 50%, #a855f7 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .hero p {
+      font-size: 1.25rem;
+      color: var(--text-dim);
+      max-width: 720px;
+      margin: 0 auto 36px auto;
+    }
+    .btn-group {
+      display: flex;
+      justify-content: center;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+    .btn {
+      padding: 12px 24px;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: 1rem;
+      text-decoration: none;
+      transition: all 0.2s;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .btn-primary {
+      background: linear-gradient(135deg, #00f0ff 0%, #0284c7 100%);
+      color: #000;
+      box-shadow: 0 4px 20px rgba(0, 240, 255, 0.35);
+    }
+    .btn-primary:hover {
+      box-shadow: 0 6px 25px rgba(0, 240, 255, 0.5);
+      transform: translateY(-1px);
+    }
+    .btn-secondary {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+    .btn-secondary:hover {
+      background: rgba(255, 255, 255, 0.1);
+      border-color: rgba(255, 255, 255, 0.2);
+    }
+    .features {
+      max-width: 1100px;
+      margin: 80px auto;
+      padding: 0 20px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 20px;
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px;
+      backdrop-filter: blur(12px);
+      transition: border-color 0.2s, transform 0.2s;
+    }
+    .card:hover {
+      border-color: rgba(0, 240, 255, 0.4);
+      transform: translateY(-2px);
+    }
+    .card-icon {
+      font-size: 1.8rem;
+      margin-bottom: 14px;
+    }
+    .card h3 {
+      font-size: 1.25rem;
+      margin-bottom: 10px;
+      color: #fff;
+    }
+    .card p {
+      color: var(--text-dim);
+      font-size: 0.95rem;
+      line-height: 1.5;
+    }
+    .install-section {
+      max-width: 900px;
+      margin: 40px auto 80px auto;
+      padding: 40px 30px;
+      background: rgba(10, 15, 26, 0.8);
+      border: 1px solid rgba(0, 240, 255, 0.2);
+      border-radius: 16px;
+      text-align: center;
+    }
+    .install-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 16px;
+      margin-top: 24px;
+    }
+    .install-pill {
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--border);
+      padding: 16px;
+      border-radius: 8px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.85rem;
+    }
+    .install-pill strong {
+      display: block;
+      color: var(--cyan);
+      font-size: 1rem;
+      margin-bottom: 4px;
+    }
+    footer {
+      border-top: 1px solid var(--border);
+      text-align: center;
+      padding: 30px 20px;
+      color: var(--text-dim);
+      font-size: 0.9rem;
+    }
+    @media (max-width: 768px) {
+      h1 { font-size: 2.3rem; }
+      .hero p { font-size: 1.05rem; }
+    }
+  </style>
+</head>
+<body>
+  <div class="hero-glow"></div>
+
+  <header>
+    <div class="logo">⚡ ARIA IDE</div>
+    <nav class="nav-links">
+      <a href="#features">Features</a>
+      <a href="#install">Download</a>
+      <a href="https://github.com/AntonyMN/aria-ide" target="_blank" rel="noreferrer">GitHub</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="badge">
+        <span>✨ 100% Free & Open-Source (MIT License)</span>
+      </div>
+      <h1>
+        Build Full-Stack Systems with <br/>
+        <span class="gradient-text">Local, Self-Hosted LLMs</span>
+      </h1>
+      <p>
+        Aria IDE puts autonomous AI directly on your laptop. No API tokens, no monthly fees, and zero code leaks. Powered by local Ollama models with live on-screen command execution, structure auditing, and human-in-the-loop controls.
+      </p>
+      <div class="btn-group">
+        <a href="https://github.com/AntonyMN/aria-ide" class="btn btn-primary" target="_blank" rel="noreferrer">
+          ⭐ Star on GitHub
+        </a>
+        <a href="#install" class="btn btn-secondary">
+          📦 Download Installers (.deb, .exe, .dmg)
+        </a>
+      </div>
+    </section>
+
+    <section id="features" class="features">
+      <div class="card">
+        <div class="card-icon">📺</div>
+        <h3>On-Screen Live Command Execution</h3>
+        <p>Never wonder what an AI agent is running behind the scenes. Commands stream character-by-character on screen with real-time stdout/stderr and sequential dependency preservation.</p>
+      </div>
+
+      <div class="card">
+        <div class="card-icon">📁</div>
+        <h3>Workspace & Structure Auditing</h3>
+        <p>After each command executes, Aria inspects directory snapshots. Project scaffolding commands (e.g. <code>laravel new blog</code>) automatically shift working directory into <code>./blog</code> and advise on the next steps.</p>
+      </div>
+
+      <div class="card">
+        <div class="card-icon">⏸️</div>
+        <h3>Interrupt & Guide with LLM</h3>
+        <p>Need to steer the AI mid-flight? Hit interrupt at any point. Aria cleanly pauses, receives your feedback, and revises its implementation plan using the local model before continuing.</p>
+      </div>
+
+      <div class="card">
+        <div class="card-icon">💻</div>
+        <h3>Hardware & VRAM Estimator</h3>
+        <p>Automatically calculates model weights, KV cache, and runtime RAM requirements against your machine's physical memory, flagging unsafe loads before system freezes occur.</p>
+      </div>
+
+      <div class="card">
+        <div class="card-icon">⚡</div>
+        <h3>Built with Tauri v2 + React 19</h3>
+        <p>Fast, memory-efficient native desktop shell powered by Tauri Rust and Vite, featuring Monaco Editor split diffs and a full xterm pseudoterminal.</p>
+      </div>
+
+      <div class="card">
+        <div class="card-icon">🛡️</div>
+        <h3>100% Private & Offline</h3>
+        <p>Works fully offline using Ollama models (such as Granite 4.2 8B, Qwen 2.5 Coder 7B, or DeepSeek Coder). Your intellectual property never leaves your machine.</p>
+      </div>
+    </section>
+
+    <section id="install" class="install-section">
+      <h2 style="font-size: 2rem; margin-bottom: 12px;">Get Aria IDE for Your Platform</h2>
+      <p style="color: var(--text-dim);">Available as native pre-packaged desktop installers built with Tauri v2.</p>
+      <div class="install-grid">
+        <div class="install-pill">
+          <strong>Linux</strong>
+          <span>.deb (Ubuntu/Debian)<br/>.AppImage (Universal)</span>
+        </div>
+        <div class="install-pill">
+          <strong>Windows</strong>
+          <span>.exe (NSIS Installer)<br/>.msi (Windows Installer)</span>
+        </div>
+        <div class="install-pill">
+          <strong>macOS</strong>
+          <span>.dmg (Apple Disk Image)<br/>.app (Universal Binary)</span>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p>Aria IDE is free software released under the <a href="https://opensource.org/licenses/MIT" style="color: var(--cyan); text-decoration: none;">MIT License</a>. Created for the global developer community.</p>
+  </footer>
+</body>
+</html>

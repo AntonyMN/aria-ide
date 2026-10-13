@@ -3,8 +3,6 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type {
   ChatMessage,
-  LocalModel,
-  ToolExecution,
   DiffProposal,
   PlanTask,
   ActivePlanExecution,
@@ -28,6 +26,7 @@ import {
   Square,
   FileCode,
   Pause,
+  Folder,
 } from 'lucide-react';
 import { runTerminalCommand, readFileContent, saveFileContent } from '../services/api';
 import { promptText } from '../services/alerts';
@@ -39,17 +38,21 @@ interface Props {
     options: { thinkingEnabled: boolean; mode: 'chat' | 'plan' }
   ) => void;
   onStopGeneration: () => void;
+  onInterrupt?: (updateMessage?: string) => void;
   selectedModel: string;
   isStreaming: boolean;
   onOpenDiffReview: (diff: DiffProposal) => void;
   workspacePath: string;
-  onApplyPlan: (plan: PlanTask[]) => void;
+  currentCwd?: string;
+  onApplyPlan?: (plan: PlanTask[]) => void;
   onFileSavedOrCreated: (createdFilePath?: string) => void;
   width?: number;
   getOriginalContent?: (filePath: string) => string | undefined;
   activePlan?: ActivePlanExecution | null;
   onProceedNextPhase?: () => void;
   onSkipPhase?: () => void;
+  onRunCommands?: (commands: string[]) => Promise<void> | void;
+  onOpenLiveRunner?: () => void;
 }
 
 // Subcomponent for fenced code blocks with Copy button and custom interactive actions
@@ -105,15 +108,25 @@ const CodeBlock: React.FC<{
     return (
       <div className="tool-pill" style={{ justifyContent: 'space-between', margin: '8px 0', alignItems: 'center' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <Terminal size={14} color="var(--accent-amber)" />
-          <span>Execute: <code style={{ color: 'var(--accent-amber)' }}>{rawCode}</code></span>
+          <Terminal size={14} color="var(--accent-cyan)" />
+          <span>Execute on screen: <code style={{ color: 'var(--accent-cyan)' }}>{rawCode}</code></span>
         </div>
         <button
           className="send-btn"
-          style={{ padding: '3px 10px', fontSize: 11 }}
+          style={{
+            padding: '3px 10px',
+            fontSize: 11,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 4,
+            background: 'rgba(0, 240, 255, 0.15)',
+            border: '1px solid rgba(0, 240, 255, 0.35)',
+            color: 'var(--accent-cyan)',
+          }}
           onClick={() => onExecuteCommand(rawCode)}
+          title="Run this shell command live on screen"
         >
-          <Play size={11} /> Run Now
+          <Play size={10} fill="currentColor" /> Run On Screen
         </button>
       </div>
     );
@@ -162,12 +175,22 @@ const CodeBlock: React.FC<{
           {isBash && (
             <button
               className="send-btn"
-              style={{ padding: '2px 8px', fontSize: 11, height: 'auto', display: 'flex', alignItems: 'center', gap: 4 }}
+              style={{
+                padding: '2px 8px',
+                fontSize: 11,
+                height: 'auto',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 4,
+                background: 'rgba(0, 240, 255, 0.15)',
+                border: '1px solid rgba(0, 240, 255, 0.35)',
+                color: 'var(--accent-cyan)',
+              }}
               onClick={() => onExecuteCommand(rawCode)}
-              title="Run this shell command in terminal"
+              title="Run this shell command live on screen"
             >
-              <Play size={10} />
-              <span>Run</span>
+              <Play size={10} fill="currentColor" />
+              <span>Run On Screen</span>
             </button>
           )}
 
@@ -205,10 +228,12 @@ export const AgentChatPane: React.FC<Props> = ({
   messages,
   onSendMessage,
   onStopGeneration,
+  onInterrupt,
   selectedModel,
   isStreaming,
   onOpenDiffReview,
   workspacePath,
+  currentCwd,
   onApplyPlan,
   onFileSavedOrCreated,
   width,
@@ -216,7 +241,12 @@ export const AgentChatPane: React.FC<Props> = ({
   activePlan,
   onProceedNextPhase,
   onSkipPhase,
+  onRunCommands,
+  onOpenLiveRunner,
 }) => {
+  // Mark onApplyPlan as referenced to avoid lint warnings
+  void onApplyPlan;
+
   const [inputPrompt, setInputPrompt] = useState('');
   const [thinkingEnabled, setThinkingEnabled] = useState(true);
   const [mode, setMode] = useState<'chat' | 'plan'>('chat');
@@ -242,19 +272,29 @@ export const AgentChatPane: React.FC<Props> = ({
 
     // 1. Explicit ```file:filename
     for (const m of content.matchAll(/```(?:file:([^\n]+))\n([\s\S]*?)```/g)) {
-      fileMatches.push({ path: m[1].trim(), content: m[2] });
+      const p = m[1].trim().replace(/^['"`]+|['"`]+$/g, '').replace(/^(\.\/|\/)/, '');
+      if (p) fileMatches.push({ path: p, content: m[2] });
     }
 
-    // 2. Explicit ```bash:run
-    for (const m of content.matchAll(/```(?:bash:run)\n([\s\S]*?)```/g)) {
-      bashMatches.push({ command: m[1].trim() });
+    // 2. Standard or explicit bash/sh/shell blocks: ```bash or ```sh or ```bash:run
+    for (const m of content.matchAll(/```(?:bash|sh|cmd|shell|zsh)(?::run)?[\r\n]([\s\S]*?)```/gi)) {
+      const rawBlock = m[1].trim();
+      const lines = rawBlock.split(/[\r\n]+/);
+      for (let line of lines) {
+        line = line.trim().replace(/^[$#]\s*/, '').trim();
+        if (!line || line.startsWith('#') || line.startsWith('//')) continue;
+        if (line.startsWith('cd ') && !line.includes('&&') && !line.includes(';')) continue;
+        if (!bashMatches.some((b) => b.command === line)) {
+          bashMatches.push({ command: line });
+        }
+      }
     }
 
     // 3. Fallback Heuristic: Filename in parentheses or text preceding a code block
     // e.g. "create a new JavaScript file ( script.js ) to handle the calculations: ```javascript"
     const heuristicRegex = /(?:create|file|in|named|modify)?\s*\(?\s*([a-zA-Z0-9_\-./]+\.(?:js|ts|jsx|tsx|html|css|json|py|php|rs|vue|sh|md|sql))\s*\)?[\s\S]{0,90}```(?:[a-zA-Z0-9_-]+)?\n([\s\S]*?)```/gi;
     for (const m of content.matchAll(heuristicRegex)) {
-      const fileName = m[1].trim();
+      const fileName = m[1].trim().replace(/^['"`]+|['"`]+$/g, '').replace(/^(\.\/|\/)/, '');
       const code = m[2];
       if (!fileName.includes(' ') && !fileMatches.some((f) => f.path === fileName) && code.trim().length > 0) {
         fileMatches.push({ path: fileName, content: code });
@@ -264,7 +304,7 @@ export const AgentChatPane: React.FC<Props> = ({
     // 4. Fallback: Code block where first line is a filename comment: // script.js
     const commentRegex = /```(?:[a-zA-Z0-9_-]+)?\n(?:\/\/|\/\*|<!--|#)\s*([a-zA-Z0-9_\-./]+\.(?:js|ts|jsx|tsx|html|css|json|py|php|rs|vue|sh|md|sql))[\s\S]*?\n([\s\S]*?)```/gi;
     for (const m of content.matchAll(commentRegex)) {
-      const fileName = m[1].trim();
+      const fileName = m[1].trim().replace(/^['"`]+|['"`]+$/g, '').replace(/^(\.\/|\/)/, '');
       const code = m[0].replace(/```[^\n]*\n/, '').replace(/\n```$/, '');
       if (!fileName.includes(' ') && !fileMatches.some((f) => f.path === fileName)) {
         fileMatches.push({ path: fileName, content: code });
@@ -306,32 +346,62 @@ export const AgentChatPane: React.FC<Props> = ({
 
       onFileSavedOrCreated(lastCreatedPath);
 
-      // 2. Execute bash commands sequentially
-      for (let j = 0; j < bashMatches.length; j++) {
-        const cmd = bashMatches[j][1].trim();
-        setExecutionState((prev) => ({
-          ...prev,
-          [msgId]: { status: 'running', log: `Executing command [${j + 1}/${bashMatches.length}]: ${cmd}...` },
-        }));
-
-        const res = await runTerminalCommand(cmd, workspacePath);
-        if (res.hasError) {
+      // 2. Execute bash commands sequentially on screen
+      if (bashMatches.length > 0) {
+        if (onRunCommands) {
           setExecutionState((prev) => ({
             ...prev,
-            [msgId]: { status: 'error', log: `Command failed: ${cmd}\n${res.stderr || res.stdout}` },
+            [msgId]: {
+              status: 'running',
+              log: `Streaming ${bashMatches.length} command(s) live on screen in Command Runner...`,
+            },
           }));
+          const commands = bashMatches.map((b) => b.command);
+          await onRunCommands(commands);
+          setExecutionState((prev) => ({
+            ...prev,
+            [msgId]: {
+              status: 'done',
+              log: `Executed ${fileMatches.length > 0 ? `${fileMatches.length} files and ` : ''}${bashMatches.length} command(s) live on screen!`,
+            },
+          }));
+        } else {
+          for (let j = 0; j < bashMatches.length; j++) {
+            const cmd = bashMatches[j].command.trim();
+            setExecutionState((prev) => ({
+              ...prev,
+              [msgId]: { status: 'running', log: `Executing command [${j + 1}/${bashMatches.length}]: ${cmd}...` },
+            }));
 
-          // Strict limit: only allow 1 automatic self-correction attempt to prevent infinite loops!
-          if (autoRetryCountRef.current < 1) {
-            autoRetryCountRef.current++;
-            onSendMessage(
-              `Command failed:\n\`\`\`bash\n${cmd}\n\`\`\`\nError output:\n\`\`\`\n${res.stderr || res.stdout}\n\`\`\`\nPlease analyze this error, adjust the plan, and provide the fix.`,
-              { thinkingEnabled: true, mode: 'chat' }
-            );
+            const res = await runTerminalCommand(cmd, currentCwd || workspacePath);
+            if (res.hasError) {
+              setExecutionState((prev) => ({
+                ...prev,
+                [msgId]: { status: 'error', log: `Command failed: ${cmd}\n${res.stderr || res.stdout}` },
+              }));
+
+              // Strict limit: only allow 1 automatic self-correction attempt to prevent infinite loops!
+              if (autoRetryCountRef.current < 1) {
+                autoRetryCountRef.current++;
+                onSendMessage(
+                  `Command failed:\n\`\`\`bash\n${cmd}\n\`\`\`\nError output:\n\`\`\`\n${res.stderr || res.stdout}\n\`\`\`\nPlease analyze this error, adjust the plan, and provide the fix.`,
+                  { thinkingEnabled: true, mode: 'chat' }
+                );
+              }
+              isExecutingRef.current = false;
+              return;
+            }
           }
-          isExecutingRef.current = false;
-          return;
+          setExecutionState((prev) => ({
+            ...prev,
+            [msgId]: { status: 'done', log: 'All actions executed successfully!' },
+          }));
         }
+      } else {
+        setExecutionState((prev) => ({
+          ...prev,
+          [msgId]: { status: 'done', log: 'All files written successfully!' },
+        }));
       }
 
       setExecutionState((prev) => ({
@@ -367,7 +437,17 @@ export const AgentChatPane: React.FC<Props> = ({
 
   const handleSubmit = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if (!inputPrompt.trim() || isStreaming) return;
+    if (!inputPrompt.trim()) return;
+
+    // If currently streaming / executing, this prompt acts as an interruption & guidance command!
+    if (isStreaming) {
+      if (onInterrupt) {
+        onInterrupt(inputPrompt);
+        setInputPrompt('');
+      }
+      return;
+    }
+
     onSendMessage(inputPrompt, { thinkingEnabled, mode });
     setInputPrompt('');
   };
@@ -400,8 +480,12 @@ export const AgentChatPane: React.FC<Props> = ({
   };
 
   const handleExecuteCommand = async (command: string) => {
+    if (onRunCommands) {
+      onRunCommands([command]);
+      return;
+    }
     try {
-      const res = await runTerminalCommand(command, workspacePath);
+      const res = await runTerminalCommand(command, currentCwd || workspacePath);
       if (res.hasError) {
         onSendMessage(
           `Command "${command}" failed with error:\n${res.stderr || res.stdout}\nPlease analyze the error and fix it.`,
@@ -533,6 +617,100 @@ export const AgentChatPane: React.FC<Props> = ({
                 </div>
               )}
 
+              {/* Autonomous Command & Structure Audit Card */}
+              {msg.commandAudit && (
+                <div style={{
+                  marginTop: 10,
+                  padding: '10px 12px',
+                  borderRadius: 8,
+                  background: 'rgba(0, 240, 255, 0.05)',
+                  border: '1px solid rgba(0, 240, 255, 0.25)',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 6,
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <Sparkles size={14} color="var(--accent-cyan)" />
+                      <span style={{ fontWeight: 700, fontSize: 12, color: 'var(--accent-cyan)' }}>
+                        Command & Structure Audit
+                      </span>
+                    </div>
+                    <span className={`badge badge-${msg.commandAudit.status === 'success' ? 'safe' : 'warning'}`} style={{ fontSize: 9 }}>
+                      {msg.commandAudit.status.toUpperCase()}
+                    </span>
+                  </div>
+
+                  <div style={{ fontSize: 12, color: 'var(--text-main)', lineHeight: 1.4 }}>
+                    {msg.commandAudit.summary}
+                  </div>
+
+                  {msg.commandAudit.relativeCwd && msg.commandAudit.relativeCwd !== '.' && (
+                    <div style={{
+                      fontSize: 11,
+                      color: 'var(--accent-cyan)',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 4,
+                      background: 'rgba(0,0,0,0.3)',
+                      padding: '2px 6px',
+                      borderRadius: 4,
+                      alignSelf: 'flex-start',
+                    }}>
+                      <Folder size={11} />
+                      <span>CWD moved into: <code>./{msg.commandAudit.relativeCwd}</code></span>
+                    </div>
+                  )}
+
+                  {msg.commandAudit.wayForward && (
+                    <div style={{
+                      fontSize: 11.5,
+                      color: 'var(--text-muted)',
+                      background: 'rgba(0,0,0,0.3)',
+                      padding: '5px 8px',
+                      borderRadius: 4,
+                      borderLeft: '2px solid var(--accent-cyan)',
+                    }}>
+                      <strong style={{ color: 'var(--accent-cyan)' }}>Way Forward from AI: </strong>
+                      {msg.commandAudit.wayForward}
+                    </div>
+                  )}
+
+                  {msg.commandAudit.suggestedNextCommands && msg.commandAudit.suggestedNextCommands.length > 0 && (
+                    <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, marginTop: 4 }}>
+                      <span style={{ fontSize: 11, color: 'var(--text-dim)' }}>Next Step:</span>
+                      {msg.commandAudit.suggestedNextCommands.map((cmd, cIdx) => (
+                        <button
+                          key={cIdx}
+                          className="send-btn"
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 4,
+                            padding: '2px 8px',
+                            background: 'rgba(0, 240, 255, 0.12)',
+                            border: '1px solid rgba(0, 240, 255, 0.35)',
+                            borderRadius: 4,
+                            color: 'var(--accent-cyan)',
+                            fontSize: 11,
+                            fontFamily: 'var(--font-mono)',
+                            cursor: 'pointer',
+                          }}
+                          onClick={() => {
+                            if (onRunCommands) onRunCommands([cmd]);
+                            else handleExecuteCommand(cmd);
+                          }}
+                          title={`Run suggested command live on screen: ${cmd}`}
+                        >
+                          <Play size={10} fill="currentColor" />
+                          <span>{cmd}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
               {/* Autonomous Action Execution Status Bar */}
               {hasActions && msg.role === 'assistant' && !msg.isStreaming && (
                 <div style={{
@@ -562,6 +740,25 @@ export const AgentChatPane: React.FC<Props> = ({
                   </div>
 
                   <div style={{ display: 'flex', gap: 6 }}>
+                    {bashMatches.length > 0 && onOpenLiveRunner && (
+                      <button
+                        className="send-btn"
+                        style={{
+                          padding: '4px 8px',
+                          fontSize: 11,
+                          background: 'rgba(0, 240, 255, 0.1)',
+                          color: 'var(--accent-cyan)',
+                          border: '1px solid rgba(0, 240, 255, 0.25)',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 4,
+                        }}
+                        onClick={onOpenLiveRunner}
+                        title="Switch to Live On-Screen Command Runner"
+                      >
+                        <Terminal size={11} /> Screen Runner
+                      </button>
+                    )}
                     {currentExec?.status === 'error' && (
                       <button
                         className="send-btn"
@@ -587,7 +784,11 @@ export const AgentChatPane: React.FC<Props> = ({
                       onClick={() => handleExecuteAllActions(msg.id, msg.content)}
                       disabled={currentExec?.status === 'running'}
                     >
-                      {currentExec?.status === 'running' ? 'Executing...' : currentExec?.status === 'done' ? 'Re-Run Actions' : 'Run All Actions'}
+                      {currentExec?.status === 'running'
+                        ? 'Running On Screen...'
+                        : currentExec?.status === 'done'
+                        ? 'Re-Run On Screen'
+                        : 'Run On Screen'}
                     </button>
                   </div>
                 </div>
@@ -598,16 +799,21 @@ export const AgentChatPane: React.FC<Props> = ({
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Phase Breather & Proceed Banner (Pauses between phases to let LLM breathe) */}
-      {activePlan && activePlan.status === 'paused' && activePlan.phases[activePlan.currentPhaseIndex] && (
+      {/* Phase Breather / Interrupted Banner */}
+      {activePlan && (activePlan.status === 'paused' || activePlan.status === 'interrupted') && (
         <div className="phase-breather-banner">
           <div style={{ display: 'flex', flexDirection: 'column', gap: 3, flex: 1, minWidth: 0 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              <span className="badge badge-safe" style={{ fontSize: 10, padding: '2px 6px', display: 'flex', alignItems: 'center', gap: 4 }}>
-                <Pause size={10} /> Paused for Breather
+              <span
+                className={`badge badge-${activePlan.status === 'interrupted' ? 'warning' : 'safe'}`}
+                style={{ fontSize: 10, padding: '2px 6px', display: 'flex', alignItems: 'center', gap: 4 }}
+              >
+                <Pause size={10} /> {activePlan.status === 'interrupted' ? 'Paused (Interrupted by User)' : 'Paused for Review'}
               </span>
               <span style={{ fontSize: 11, color: 'var(--text-dim)' }}>
-                Phase {activePlan.currentPhaseIndex} of {activePlan.phases.length} complete
+                {activePlan.lastInterruption
+                  ? `Update: "${activePlan.lastInterruption.message.slice(0, 40)}..."`
+                  : `Phase ${activePlan.currentPhaseIndex} of ${activePlan.phases.length} complete`}
               </span>
             </div>
             <div style={{
@@ -618,7 +824,9 @@ export const AgentChatPane: React.FC<Props> = ({
               overflow: 'hidden',
               textOverflow: 'ellipsis',
             }}>
-              Next: Phase {activePlan.currentPhaseIndex + 1}: {activePlan.phases[activePlan.currentPhaseIndex].title}
+              {activePlan.phases[activePlan.currentPhaseIndex]
+                ? `Ready for Phase ${activePlan.currentPhaseIndex + 1}: ${activePlan.phases[activePlan.currentPhaseIndex].title}`
+                : 'All phases ready'}
             </div>
           </div>
 
@@ -677,6 +885,16 @@ export const AgentChatPane: React.FC<Props> = ({
                 <RotateCw size={11} className="spin" /> Generating...
               </span>
               <button
+                className="btn-interrupt"
+                style={{ padding: '2px 8px', fontSize: 11, height: 'auto' }}
+                onClick={() => {
+                  if (onInterrupt) onInterrupt(inputPrompt);
+                }}
+                title="Pause execution to guide or update the AI"
+              >
+                <Pause size={10} /> Interrupt
+              </button>
+              <button
                 className="icon-btn"
                 style={{
                   color: '#ef4444',
@@ -703,9 +921,11 @@ export const AgentChatPane: React.FC<Props> = ({
           <textarea
             className="ai-textarea"
             placeholder={
-              activePlan && activePlan.status === 'paused' && activePlan.phases[activePlan.currentPhaseIndex]
-                ? `Type 'proceed' to start Phase ${activePlan.currentPhaseIndex + 1}, or ask a question / customize...`
-                : "Tell the AI what to build or modify... (it will plan, generate files, and run commands)"
+              isStreaming
+                ? "Type a command or update to interrupt the AI with new guidance..."
+                : activePlan && (activePlan.status === 'paused' || activePlan.status === 'interrupted')
+                ? "Type 'proceed' to resume, or provide updated guidance/instructions to revise..."
+                : "Tell the AI what to build or modify... (it will plan, generate files, and run commands on screen)"
             }
             value={inputPrompt}
             onChange={(e) => setInputPrompt(e.target.value)}
@@ -717,25 +937,39 @@ export const AgentChatPane: React.FC<Props> = ({
             }}
           />
           {isStreaming ? (
-            <button
-              className="send-btn"
-              style={{
-                height: 'auto',
-                alignSelf: 'stretch',
-                background: 'rgba(239, 68, 68, 0.25)',
-                border: '1px solid #ef4444',
-                color: '#ef4444',
-                display: 'flex',
-                alignItems: 'center',
-                gap: 6,
-                padding: '0 14px',
-              }}
-              onClick={onStopGeneration}
-              title="Stop generation immediately (Esc)"
-            >
-              <Square size={13} fill="currentColor" />
-              <span>Stop</span>
-            </button>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <button
+                className="btn-interrupt"
+                style={{
+                  height: 'auto',
+                  alignSelf: 'stretch',
+                  padding: '0 12px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 6,
+                }}
+                onClick={() => handleSubmit()}
+                title="Interrupt and update AI with typed instructions"
+              >
+                <Pause size={13} />
+                <span>{inputPrompt.trim() ? 'Interrupt & Update' : 'Pause'}</span>
+              </button>
+              <button
+                className="send-btn"
+                style={{
+                  height: 'auto',
+                  alignSelf: 'stretch',
+                  background: 'rgba(239, 68, 68, 0.25)',
+                  border: '1px solid #ef4444',
+                  color: '#ef4444',
+                  padding: '0 10px',
+                }}
+                onClick={onStopGeneration}
+                title="Stop generation immediately (Esc)"
+              >
+                <Square size={13} fill="currentColor" />
+              </button>
+            </div>
           ) : (
             <button
               className="send-btn"

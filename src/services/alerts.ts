@@ -1,7 +1,7 @@
 import Swal from 'sweetalert2';
 import 'sweetalert2/dist/sweetalert2.min.css';
 
-// Base dark theme configuration for SweetAlert2 matching Antigravity IDE
+// Base dark theme configuration for SweetAlert2 matching Aria IDE
 const darkSwal = Swal.mixin({
   background: '#0c101a',
   color: '#e2e8f0',

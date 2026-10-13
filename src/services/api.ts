@@ -106,6 +106,32 @@ export async function switchModelClean(
   return res.json();
 }
 
+export async function fetchInitialWorkspace(): Promise<{ path: string | null; cwd: string }> {
+  const res = await fetch(`${API_BASE}/workspace/initial`);
+  if (!res.ok) throw new Error('Failed to fetch initial workspace');
+  return res.json();
+}
+
+export async function openWorkspaceCli(targetPath: string): Promise<{ success: boolean; path: string }> {
+  const res = await fetch(`${API_BASE}/workspace/open`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: targetPath }),
+  });
+  if (!res.ok) throw new Error('Failed to open workspace');
+  return res.json();
+}
+
+export async function installCliToPath(): Promise<{ success: boolean; installedPath: string; instructions: string }> {
+  const res = await fetch(`${API_BASE}/system/install-cli`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({}),
+  });
+  if (!res.ok) throw new Error('Failed to install aria to PATH');
+  return res.json();
+}
+
 export async function fetchFileTree(dirPath?: string): Promise<{ rootPath: string; tree: FileNode[] }> {
   const url = dirPath ? `${API_BASE}/workspace/tree?path=${encodeURIComponent(dirPath)}` : `${API_BASE}/workspace/tree`;
   const res = await fetch(url);

@@ -30,6 +30,8 @@ import {
   fetchActiveModels,
   unloadAllModels,
   switchModelClean,
+  fetchInitialWorkspace,
+  installCliToPath,
 } from './services/api';
 import { FileTree } from './components/FileTree';
 import { ModelSelectorModal } from './components/ModelSelectorModal';
@@ -69,12 +71,29 @@ export function App() {
 
   // Workspace & File Tree State
   const [workspacePath, setWorkspacePath] = useState<string>(() => {
+    const urlParams = new URLSearchParams(window.location.search);
+    const queryPath = urlParams.get('path') || urlParams.get('workspace');
+    if (queryPath) {
+      localStorage.setItem('ide_active_workspace', queryPath);
+      return queryPath;
+    }
     return localStorage.getItem('ide_active_workspace') || '/home/anto/builds/ide';
   });
   const [currentCwd, setCurrentCwd] = useState<string>(() => {
+    const urlParams = new URLSearchParams(window.location.search);
+    const queryPath = urlParams.get('path') || urlParams.get('workspace');
+    if (queryPath) {
+      localStorage.setItem('ide_active_cwd', queryPath);
+      return queryPath;
+    }
     return localStorage.getItem('ide_active_cwd') || localStorage.getItem('ide_active_workspace') || '/home/anto/builds/ide';
   });
-  const [isWorkspaceModalOpen, setIsWorkspaceModalOpen] = useState(true);
+  const [isWorkspaceModalOpen, setIsWorkspaceModalOpen] = useState(() => {
+    const urlParams = new URLSearchParams(window.location.search);
+    const queryPath = urlParams.get('path') || urlParams.get('workspace');
+    if (queryPath) return false;
+    return !localStorage.getItem('ide_active_workspace');
+  });
   const [fileTree, setFileTree] = useState<FileNode[]>([]);
   const [activeFilePath, setActiveFilePath] = useState<string>('');
 
@@ -335,9 +354,50 @@ export function App() {
     }
   };
 
+  // Install CLI to PATH helper
+  const handleInstallCli = async () => {
+    try {
+      showInfoToast('Installing "aria" command into your PATH...');
+      const res = await installCliToPath();
+      if (res.success) {
+        showSuccessToast(`✓ 'aria' installed at ${res.installedPath}! You can now run "aria ." from any terminal.`);
+      }
+    } catch (err: any) {
+      console.error('Failed to install CLI:', err);
+      showErrorAlert('Installation Failed', err.message || 'Could not install aria to PATH');
+    }
+  };
+
   useEffect(() => {
     loadModelsAndHardware();
-    loadWorkspace(undefined, true);
+
+    const initWorkspace = async () => {
+      // 1. Check if URL has ?path= or ?workspace=
+      const urlParams = new URLSearchParams(window.location.search);
+      const queryPath = urlParams.get('path') || urlParams.get('workspace');
+      if (queryPath) {
+        await loadWorkspace(queryPath, true);
+        return;
+      }
+
+      // 2. Check if backend has INITIAL_WORKSPACE from CLI (aria .)
+      try {
+        const initRes = await fetchInitialWorkspace();
+        if (initRes.path && initRes.path !== workspacePath) {
+          setWorkspacePath(initRes.path);
+          setCurrentCwd(initRes.path);
+          localStorage.setItem('ide_active_workspace', initRes.path);
+          setIsWorkspaceModalOpen(false);
+          await loadWorkspace(initRes.path, true);
+          return;
+        }
+      } catch (e) {}
+
+      // 3. Fallback to normal saved workspace
+      loadWorkspace(undefined, true);
+    };
+
+    initWorkspace();
 
     // Poll memory periodically
     const interval = setInterval(async () => {
@@ -1527,29 +1587,51 @@ Output ONLY the file code inside:
           )}
         </div>
 
-        {/* Workspace Path Breadcrumb */}
-        <div
-          onClick={handleSwitchWorkspace}
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 8,
-            fontSize: 12,
-            fontFamily: 'var(--font-mono)',
-            background: 'rgba(255, 255, 255, 0.03)',
-            padding: '4px 12px',
-            borderRadius: 6,
-            border: '1px solid var(--border-color)',
-            cursor: 'pointer',
-            maxWidth: 380,
-            overflow: 'hidden',
-            textOverflow: 'ellipsis',
-            whiteSpace: 'nowrap',
-          }}
-          title="Click to switch workspace folder"
-        >
-          <FolderOpen size={14} color="var(--accent-blue)" />
-          <span style={{ color: 'var(--text-muted)' }}>{workspacePath}</span>
+        {/* Workspace Path Breadcrumb & Terminal CLI Helper */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <div
+            onClick={handleSwitchWorkspace}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              fontSize: 12,
+              fontFamily: 'var(--font-mono)',
+              background: 'rgba(255, 255, 255, 0.03)',
+              padding: '4px 12px',
+              borderRadius: 6,
+              border: '1px solid var(--border-color)',
+              cursor: 'pointer',
+              maxWidth: 340,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }}
+            title="Click to switch workspace folder"
+          >
+            <FolderOpen size={14} color="var(--accent-blue)" />
+            <span style={{ color: 'var(--text-muted)' }}>{workspacePath}</span>
+          </div>
+
+          <button
+            className="icon-btn"
+            onClick={handleInstallCli}
+            style={{
+              fontSize: 11,
+              padding: '4px 8px',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 5,
+              background: 'rgba(255, 255, 255, 0.03)',
+              border: '1px solid var(--border-color)',
+              color: 'var(--text-dim)',
+              borderRadius: 6,
+            }}
+            title="Terminal CLI: Run 'aria .' in any folder to open Aria IDE. Click to verify/install in PATH."
+          >
+            <TerminalIcon size={12} color="var(--accent-cyan)" />
+            <span>aria .</span>
+          </button>
         </div>
 
         {/* Hardware RAM Meter */}

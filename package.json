@@ -4,6 +4,9 @@
   "description": "Aria IDE - Open-Source Autonomous AI Development Environment powered by local, free, self-hosted LLMs",
   "license": "MIT",
   "type": "module",
+  "bin": {
+    "aria": "./bin/aria.js"
+  },
   "scripts": {
     "dev": "concurrently -n \"SERVER,VITE\" -c \"magenta,cyan\" \"node --watch server/index.js\" \"vite --host\"",
     "server": "node server/index.js",
@@ -11,7 +14,8 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "install-cli": "node bin/aria.js --install-cli"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",

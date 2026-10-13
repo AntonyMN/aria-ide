@@ -12,8 +12,9 @@ import {
   Layers,
   ChevronRight,
   Clock,
+  Terminal,
 } from 'lucide-react';
-import { fetchDirectories, createDirectory } from '../services/api';
+import { fetchDirectories, createDirectory, installCliToPath } from '../services/api';
 import { showSuccessToast, showErrorAlert } from '../services/alerts';
 
 interface Props {
@@ -133,6 +134,56 @@ export const WorkspacePickerModal: React.FC<Props> = ({
           </div>
           <button className="icon-btn" onClick={onClose}>
             <X size={18} />
+          </button>
+        </div>
+
+        {/* Terminal CLI Banner */}
+        <div
+          style={{
+            padding: '8px 16px',
+            background: 'linear-gradient(90deg, rgba(0, 240, 255, 0.08) 0%, rgba(168, 85, 247, 0.08) 100%)',
+            borderBottom: '1px solid var(--border-color)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            fontSize: 12,
+            gap: 12,
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: 'var(--text-main)' }}>
+            <Terminal size={14} color="var(--accent-cyan)" />
+            <span>
+              Tip: Open any folder from your terminal using <strong style={{ color: 'var(--accent-cyan)' }}>aria .</strong>
+            </span>
+          </div>
+          <button
+            onClick={async () => {
+              try {
+                const res = await installCliToPath();
+                if (res.success) {
+                  showSuccessToast(`✓ 'aria' installed in PATH at ${res.installedPath}!`);
+                }
+              } catch (e: any) {
+                showErrorAlert('Installation Failed', e.message || 'Could not install aria to PATH');
+              }
+            }}
+            style={{
+              background: 'rgba(0, 240, 255, 0.15)',
+              color: 'var(--accent-cyan)',
+              border: '1px solid rgba(0, 240, 255, 0.35)',
+              borderRadius: 6,
+              padding: '3px 10px',
+              fontSize: 11,
+              fontWeight: 600,
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 5,
+            }}
+            title="Install 'aria' command into system PATH"
+          >
+            <Check size={12} />
+            <span>Install "aria" in PATH</span>
           </button>
         </div>
 

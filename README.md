@@ -98,6 +98,54 @@ Once started:
 
 ---
 
+## 🚀 Launching from Terminal (`aria .`)
+
+Just like `code .` for VS Code, you can open any folder in Aria IDE directly from your terminal:
+
+```bash
+cd ~/my-awesome-project
+aria .
+```
+
+### Adding `aria` to your PATH
+
+#### Option A: One-Command Installation (Linux & macOS)
+```bash
+npm run install-cli
+# or directly:
+bash scripts/install-cli.sh
+```
+This automatically links the `aria` launcher into `~/.local/bin/aria` (no root/sudo needed).
+
+#### Option B: Windows PowerShell
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install-cli.ps1
+```
+
+#### Option C: In-App 1-Click Installation
+Inside Aria IDE:
+- Click the **`aria .`** button in the top navigation header next to your workspace path.
+- Or open the Workspace Picker modal and click **Install "aria" in PATH**.
+
+#### Option D: Global NPM Installation
+```bash
+npm install -g .
+# or
+npm link
+```
+
+### CLI Command Options
+```bash
+aria .                  # Open current folder in Aria IDE
+aria ~/projects/blog    # Open target path directly
+aria --status           # Check background server & RAM usage of loaded models
+aria --install-cli      # Re-install or verify CLI symlink in PATH
+aria --version          # Print Aria IDE version
+aria --help             # Display all CLI options
+```
+
+---
+
 ## 📦 Building Desktop Installers (.deb, .exe, .dmg)
 
 Aria IDE is built on top of **Tauri v2**, which compiles native, lightweight binary installers across Linux, Windows, and macOS.

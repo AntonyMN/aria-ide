@@ -6,6 +6,10 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import pty from 'node-pty';
+import { fileURLToPath } from 'url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 const server = http.createServer(app);
@@ -802,6 +806,75 @@ app.get('/api/workspace/activity', (req, res) => {
   try {
     const activity = loadIdeActivity(targetPath);
     res.json({ success: true, activity });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+let currentInitialWorkspace = process.env.INITIAL_WORKSPACE || null;
+
+// Initial Workspace Path API
+app.get('/api/workspace/initial', (req, res) => {
+  res.json({
+    path: currentInitialWorkspace,
+    cwd: process.cwd(),
+  });
+});
+
+// Set Active Workspace from CLI API
+app.post('/api/workspace/open', (req, res) => {
+  const { path: targetPath } = req.body;
+  if (!targetPath || !fs.existsSync(targetPath)) {
+    return res.status(400).json({ error: 'Target directory does not exist' });
+  }
+  const resolved = path.resolve(targetPath);
+  currentInitialWorkspace = resolved;
+  console.log(`[Aria IDE CLI] Opened workspace: ${resolved}`);
+  res.json({ success: true, path: resolved });
+});
+
+// System CLI Installation API: Installs 'aria' into system PATH (~/.local/bin or %USERPROFILE%\bin)
+app.post('/api/system/install-cli', (req, res) => {
+  try {
+    const isWindows = process.platform === 'win32';
+    const binDir = path.join(__dirname, '..', 'bin');
+    const cliScript = path.join(binDir, 'aria.js');
+
+    try {
+      fs.chmodSync(cliScript, 0o755);
+    } catch (e) {}
+
+    if (isWindows) {
+      const userBin = path.join(os.homedir(), 'bin');
+      if (!fs.existsSync(userBin)) fs.mkdirSync(userBin, { recursive: true });
+      const cmdPath = path.join(userBin, 'aria.cmd');
+      const cmdContent = `@echo off\r\nnode "${cliScript}" %*\r\n`;
+      fs.writeFileSync(cmdPath, cmdContent, 'utf8');
+      return res.json({
+        success: true,
+        installedPath: cmdPath,
+        instructions: `Created ${cmdPath}. Ensure ${userBin} is in your Windows PATH.`,
+      });
+    }
+
+    const localBin = path.join(os.homedir(), '.local', 'bin');
+    if (!fs.existsSync(localBin)) {
+      fs.mkdirSync(localBin, { recursive: true });
+    }
+    const symlinkPath = path.join(localBin, 'aria');
+    try {
+      if (fs.existsSync(symlinkPath) || fs.lstatSync(symlinkPath).isSymbolicLink()) {
+        fs.unlinkSync(symlinkPath);
+      }
+    } catch (e) {}
+
+    fs.symlinkSync(cliScript, symlinkPath);
+
+    return res.json({
+      success: true,
+      installedPath: symlinkPath,
+      instructions: `Symlinked to ${symlinkPath}. You can now run "aria ." in any directory.`,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2862,6 +2935,22 @@ The Aria backend will automatically create the files on disk and execute the com
     activeGenerations.delete(controller);
   }
 });
+
+// Serve built production frontend if dist directory exists
+const distPath = path.join(__dirname, '..', 'dist');
+if (fs.existsSync(distPath)) {
+  app.use(express.static(distPath));
+  app.use((req, res, next) => {
+    if (req.method !== 'GET' || req.path.startsWith('/api') || req.path.startsWith('/ws')) {
+      return next();
+    }
+    const indexPath = path.join(distPath, 'index.html');
+    if (fs.existsSync(indexPath)) {
+      return res.sendFile(indexPath);
+    }
+    next();
+  });
+}
 
 server.listen(PORT, () => {
   console.log(`[Aria IDE Backend] Listening on http://localhost:${PORT}`);

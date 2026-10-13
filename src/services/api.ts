@@ -106,6 +106,94 @@ export async function switchModelClean(
   return res.json();
 }
 
+export interface BootProgress {
+  stage: string;
+  percent: number;
+  message: string;
+}
+
+export async function bootModelStream(
+  model: string,
+  onProgress?: (progress: BootProgress) => void
+): Promise<{ success: boolean; verified: boolean; model: string; alreadyLoaded?: boolean; timeTakenMs?: number }> {
+  const res = await fetch(`${API_BASE}/models/boot-stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model }),
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: 'Failed to boot model' }));
+    throw new Error(err.error || 'Failed to boot model');
+  }
+
+  if (!res.body) throw new Error('No stream body returned for model boot');
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let finalResult = { success: false, verified: false, model };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const events = buffer.split('\n\n');
+    buffer = events.pop() || '';
+
+    for (const ev of events) {
+      if (!ev.trim()) continue;
+      const lines = ev.split('\n');
+      let eventType = 'message';
+      let dataStr = '';
+      for (const line of lines) {
+        if (line.startsWith('event: ')) eventType = line.substring(7);
+        if (line.startsWith('data: ')) dataStr = line.substring(6);
+      }
+
+      if (eventType === 'progress' && dataStr) {
+        try {
+          const p = JSON.parse(dataStr);
+          onProgress?.(p);
+        } catch (e) {}
+      } else if (eventType === 'done' && dataStr) {
+        try {
+          finalResult = JSON.parse(dataStr);
+        } catch (e) {}
+      } else if (eventType === 'error' && dataStr) {
+        try {
+          const err = JSON.parse(dataStr);
+          throw new Error(err.error || 'Model boot failed');
+        } catch (e: any) {
+          throw e;
+        }
+      }
+    }
+  }
+
+  return finalResult;
+}
+
+export async function bootModelDirect(model: string): Promise<{
+  success: boolean;
+  verified: boolean;
+  model: string;
+  alreadyLoaded?: boolean;
+  timeTakenMs?: number;
+  activeModels?: ActiveOllamaModel[];
+}> {
+  const res = await fetch(`${API_BASE}/models/boot`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: 'Failed to boot model' }));
+    throw new Error(err.error || 'Failed to boot model');
+  }
+  return res.json();
+}
+
 export async function fetchInitialWorkspace(): Promise<{ path: string | null; cwd: string }> {
   const res = await fetch(`${API_BASE}/workspace/initial`);
   if (!res.ok) throw new Error('Failed to fetch initial workspace');

@@ -689,6 +689,95 @@ body {
   cursor: not-allowed;
 }
 
+/* Manual Boot & LLM Waking-Up Controls */
+.boot-model-header-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-radius: 8px;
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.15), rgba(234, 88, 12, 0.15));
+  border: 1px solid rgba(245, 158, 11, 0.4);
+  color: #fbbf24;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  box-shadow: 0 0 12px rgba(245, 158, 11, 0.12);
+}
+
+.boot-model-header-btn:hover {
+  background: linear-gradient(135deg, rgba(245, 158, 11, 0.28), rgba(234, 88, 12, 0.28));
+  border-color: #fbbf24;
+  color: #fff;
+  transform: translateY(-1px);
+  box-shadow: 0 0 18px rgba(245, 158, 11, 0.3);
+}
+
+.cold-badge {
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  background: rgba(245, 158, 11, 0.25);
+  color: #fef3c7;
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+.model-booting-pill {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-radius: 8px;
+  background: linear-gradient(135deg, rgba(0, 240, 255, 0.15), rgba(139, 92, 246, 0.15));
+  border: 1px solid rgba(0, 240, 255, 0.45);
+  color: #00f0ff;
+  font-size: 11px;
+  font-weight: 600;
+  box-shadow: 0 0 14px rgba(0, 240, 255, 0.2);
+  animation: pulse-border 1.5s infinite;
+}
+
+.spin-slow {
+  animation: spin 3s linear infinite;
+}
+
+@keyframes pulse-border {
+  0% { border-color: rgba(0, 240, 255, 0.3); }
+  50% { border-color: rgba(0, 240, 255, 0.8); }
+  100% { border-color: rgba(0, 240, 255, 0.3); }
+}
+
+.btn-boot-ram {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  background: linear-gradient(135deg, rgba(0, 240, 255, 0.12), rgba(139, 92, 246, 0.12));
+  color: #00f0ff;
+  border: 1px solid rgba(0, 240, 255, 0.4);
+  transition: all 0.2s ease;
+}
+
+.btn-boot-ram:hover:not(:disabled) {
+  background: linear-gradient(135deg, rgba(0, 240, 255, 0.25), rgba(139, 92, 246, 0.25));
+  border-color: #00f0ff;
+  color: #fff;
+  transform: translateY(-1px);
+  box-shadow: 0 0 12px rgba(0, 240, 255, 0.3);
+}
+
+.btn-boot-ram:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 /* Diff Viewer Actions */
 .diff-actions {
   display: flex;

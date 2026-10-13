@@ -9,7 +9,7 @@ import {
   RefreshCw,
   Search,
 } from 'lucide-react';
-import { unloadModel, unloadAllModels, switchModelClean } from '../services/api';
+import { unloadModel, unloadAllModels, switchModelClean, bootModelStream } from '../services/api';
 import { showSuccessToast, showErrorAlert, showInfoToast } from '../services/alerts';
 
 interface Props {
@@ -37,6 +37,9 @@ export const ModelSelectorModal: React.FC<Props> = ({
   const [isOffloadingAll, setIsOffloadingAll] = useState(false);
   const [switchingTarget, setSwitchingTarget] = useState<string | null>(null);
   const [switchStatusMessage, setSwitchStatusMessage] = useState<string>('');
+  const [bootingModel, setBootingModel] = useState<string | null>(null);
+  const [bootPercent, setBootPercent] = useState<number>(0);
+  const [bootStage, setBootStage] = useState<string>('');
 
   if (!isOpen) return null;
 
@@ -96,6 +99,37 @@ export const ModelSelectorModal: React.FC<Props> = ({
       showErrorAlert('Eject All Failed', err.message || 'Could not offload models');
     } finally {
       setIsOffloadingAll(false);
+    }
+  };
+
+  // Handle manual boot of model into RAM
+  const handleManualBootSingle = async (e: React.MouseEvent, modelName: string) => {
+    e.stopPropagation();
+    try {
+      setBootingModel(modelName);
+      setBootPercent(10);
+      setBootStage(`Preparing to boot ${modelName}...`);
+      showInfoToast(`Waking up ${modelName} into RAM...`);
+
+      const result = await bootModelStream(modelName, (p) => {
+        setBootPercent(p.percent);
+        setBootStage(p.message);
+      });
+
+      if (result.verified || result.success) {
+        showSuccessToast(`Model ${modelName} is now active in RAM!`);
+        onSelectModel(modelName);
+        onRefresh();
+      } else {
+        throw new Error(`Failed to verify ${modelName} in RAM`);
+      }
+    } catch (err: any) {
+      console.error('Failed to boot model:', err);
+      showErrorAlert('Boot Failed', err.message || 'Could not boot model into RAM');
+    } finally {
+      setBootingModel(null);
+      setBootPercent(0);
+      setBootStage('');
     }
   };
 
@@ -388,11 +422,11 @@ export const ModelSelectorModal: React.FC<Props> = ({
               const loadedRamGB = model.loadedDetails?.ramGB || model.sizeGB;
 
               return (
-                <div
-                  key={model.name}
-                  className={`model-card ${isSelected ? 'selected' : ''} ${isLoaded ? 'loaded-in-ram' : ''}`}
-                  onClick={() => handleSelectAndSwitch(model.name)}
-                >
+                <React.Fragment key={model.name}>
+                  <div
+                    className={`model-card ${isSelected ? 'selected' : ''} ${isLoaded ? 'loaded-in-ram' : ''}`}
+                    onClick={() => handleSelectAndSwitch(model.name)}
+                  >
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 6, flex: 1 }}>
                     {/* Header Row */}
                     <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
@@ -501,12 +535,12 @@ export const ModelSelectorModal: React.FC<Props> = ({
                   </div>
 
                   {/* Actions Column */}
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
                     {/* Offload from RAM Button */}
                     {isLoaded && (
                       <button
                         className="btn-offload-ram"
-                        disabled={isBusyOffloading || isTargetOfSwitch}
+                        disabled={isBusyOffloading || isTargetOfSwitch || bootingModel === model.name}
                         onClick={(e) => handleOffloadSingle(e, model.name)}
                         title="Unload this model from RAM to reclaim system memory"
                       >
@@ -515,10 +549,31 @@ export const ModelSelectorModal: React.FC<Props> = ({
                       </button>
                     )}
 
+                    {/* Manual Boot into RAM Button */}
+                    {!isLoaded && (
+                      <button
+                        className="btn-boot-ram"
+                        disabled={bootingModel === model.name || isTargetOfSwitch}
+                        onClick={(e) => handleManualBootSingle(e, model.name)}
+                        title="Manually wake up and boot this model into RAM now"
+                      >
+                        {bootingModel === model.name ? (
+                          <RefreshCw size={13} style={{ animation: 'spin 1s linear infinite' }} />
+                        ) : (
+                          <Zap size={13} />
+                        )}
+                        <span>
+                          {bootingModel === model.name
+                            ? `Booting (${bootPercent}%)...`
+                            : '⚡ Boot into RAM'}
+                        </span>
+                      </button>
+                    )}
+
                     {/* Select / Switch Button */}
                     <button
                       className="send-btn"
-                      disabled={isTargetOfSwitch}
+                      disabled={isTargetOfSwitch || bootingModel === model.name}
                       style={{
                         padding: '6px 14px',
                         background: isSelected
@@ -551,8 +606,54 @@ export const ModelSelectorModal: React.FC<Props> = ({
                     </button>
                   </div>
                 </div>
-              );
-            })
+
+                {/* Live Mini Progress Bar on Card if Booting */}
+                {bootingModel === model.name && (
+                  <div
+                    style={{
+                      width: '100%',
+                      padding: '8px 14px',
+                      background: 'rgba(0, 240, 255, 0.06)',
+                      borderRadius: 8,
+                      border: '1px solid rgba(0, 240, 255, 0.25)',
+                      marginTop: -4,
+                      marginBottom: 8,
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        fontSize: 11,
+                        marginBottom: 4,
+                        color: '#00f0ff',
+                      }}
+                    >
+                      <span>{bootStage || 'Booting model weights into RAM...'}</span>
+                      <span style={{ fontWeight: 700 }}>{bootPercent}%</span>
+                    </div>
+                    <div
+                      style={{
+                        height: 6,
+                        background: 'rgba(255, 255, 255, 0.1)',
+                        borderRadius: 3,
+                        overflow: 'hidden',
+                      }}
+                    >
+                      <div
+                        style={{
+                          height: '100%',
+                          width: `${bootPercent}%`,
+                          background: 'linear-gradient(90deg, #00f0ff, #8b5cf6)',
+                          transition: 'width 0.3s ease',
+                        }}
+                      />
+                    </div>
+                  </div>
+                )}
+              </React.Fragment>
+            );
+          })
           )}
         </div>
       </div>

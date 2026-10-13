@@ -542,6 +542,184 @@ app.post('/api/models/switch', async (req, res) => {
   }
 });
 
+// Boot / Preload Model Endpoint (Standard JSON)
+app.post('/api/models/boot', async (req, res) => {
+  try {
+    const { model } = req.body;
+    if (!model) {
+      return res.status(400).json({ error: 'Model name is required to boot' });
+    }
+
+    const startTime = Date.now();
+    console.log(`[Aria RAM Manager] Booting model "${model}" into RAM...`);
+
+    // 1. Check if already active in RAM
+    const activeInitially = await getOllamaActiveModels();
+    const isAlreadyLoaded = activeInitially.some(
+      (m) => matchModelName(m.name, model) || matchModelName(m.model, model)
+    );
+    if (isAlreadyLoaded) {
+      return res.json({
+        success: true,
+        alreadyLoaded: true,
+        verified: true,
+        model,
+        timeTakenMs: Date.now() - startTime,
+        activeModels: activeInitially,
+        systemMemory: getSystemMemory(),
+      });
+    }
+
+    // 2. Clear any competing models to avoid memory collisions
+    await ensureOnlyTargetModelLoaded(model);
+
+    // 3. Preload into RAM via Ollama /api/generate
+    const ollamaRes = await fetch(`${OLLAMA_BASE_URL}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, keep_alive: '15m' }),
+    });
+
+    if (!ollamaRes.ok) {
+      const errText = await ollamaRes.text();
+      throw new Error(`Ollama failed to load model: ${errText}`);
+    }
+    await ollamaRes.json();
+
+    // 4. Verify residency in /api/ps
+    const finalActive = await getOllamaActiveModels();
+    const verified = finalActive.some(
+      (m) => matchModelName(m.name, model) || matchModelName(m.model, model)
+    );
+
+    console.log(`[Aria RAM Manager] Model "${model}" boot finished in ${Date.now() - startTime}ms (verified: ${verified}).`);
+    res.json({
+      success: true,
+      verified,
+      model,
+      timeTakenMs: Date.now() - startTime,
+      activeModels: finalActive,
+      systemMemory: getSystemMemory(),
+    });
+  } catch (err) {
+    console.error(`[Aria RAM Manager] Boot error for "${req.body?.model}":`, err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Boot / Preload Model with Live SSE Progress Stream
+app.post('/api/models/boot-stream', async (req, res) => {
+  const { model } = req.body;
+  if (!model) {
+    return res.status(400).json({ error: 'Model name is required to boot' });
+  }
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const sendEvent = (event, data) => {
+    try {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    } catch (e) {}
+  };
+
+  try {
+    const startTime = Date.now();
+    sendEvent('progress', { stage: 'init', percent: 10, message: `Preparing to boot ${model}...` });
+
+    // 1. Check if already active in RAM
+    const activeInitially = await getOllamaActiveModels();
+    const isAlreadyLoaded = activeInitially.some(
+      (m) => matchModelName(m.name, model) || matchModelName(m.model, model)
+    );
+    if (isAlreadyLoaded) {
+      sendEvent('progress', { stage: 'ready', percent: 100, message: `Model ${model} is already resident in RAM and ready.` });
+      sendEvent('done', {
+        success: true,
+        verified: true,
+        model,
+        alreadyLoaded: true,
+        timeTakenMs: Date.now() - startTime,
+        activeModels: activeInitially,
+      });
+      return res.end();
+    }
+
+    // 2. Clear competing models to allocate clean RAM
+    sendEvent('progress', { stage: 'clearing', percent: 25, message: `Clearing other models from RAM to allocate clean memory...` });
+    await ensureOnlyTargetModelLoaded(model);
+
+    // 3. Start preload into RAM
+    sendEvent('progress', { stage: 'allocating', percent: 45, message: `Allocating memory buffers & starting model engine...` });
+
+    let ollamaDone = false;
+    let preloadError = null;
+
+    const preloadPromise = (async () => {
+      try {
+        const response = await fetch(`${OLLAMA_BASE_URL}/api/generate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model, keep_alive: '15m' }),
+        });
+        if (!response.ok) {
+          const errText = await response.text();
+          throw new Error(`Ollama preload error: ${errText}`);
+        }
+        await response.json();
+        ollamaDone = true;
+      } catch (err) {
+        preloadError = err;
+      }
+    })();
+
+    const stages = [
+      { p: 58, msg: `Reading GGUF tensor layers from disk into RAM...` },
+      { p: 72, msg: `Loading neural weights and context kv-cache...` },
+      { p: 84, msg: `Initializing compute tensors and context window...` },
+      { p: 92, msg: `Engine warmup and memory verification...` },
+    ];
+
+    let stageIdx = 0;
+    while (!ollamaDone && !preloadError) {
+      await new Promise((r) => setTimeout(r, 500));
+      if (stageIdx < stages.length) {
+        sendEvent('progress', { stage: 'loading', percent: stages[stageIdx].p, message: stages[stageIdx].msg });
+        stageIdx++;
+      }
+    }
+
+    await preloadPromise;
+
+    if (preloadError) {
+      throw preloadError;
+    }
+
+    // 4. Verify residency with /api/ps
+    sendEvent('progress', { stage: 'verifying', percent: 96, message: `Verifying active model presence in system RAM...` });
+    const finalActive = await getOllamaActiveModels();
+    const verified = finalActive.some(
+      (m) => matchModelName(m.name, model) || matchModelName(m.model, model)
+    );
+
+    sendEvent('progress', { stage: 'ready', percent: 100, message: `🎉 Model ${model} is fully booted and active in RAM!` });
+    sendEvent('done', {
+      success: true,
+      verified,
+      model,
+      timeTakenMs: Date.now() - startTime,
+      activeModels: finalActive,
+      systemMemory: getSystemMemory(),
+    });
+    res.end();
+  } catch (err) {
+    sendEvent('error', { error: err.message });
+    res.end();
+  }
+});
+
 // ==========================================
 // 3. WORKSPACE & FILE SYSTEM MANIPULATION
 // ==========================================

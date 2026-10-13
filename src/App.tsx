@@ -30,11 +30,13 @@ import {
   fetchActiveModels,
   unloadAllModels,
   switchModelClean,
+  bootModelStream,
   fetchInitialWorkspace,
   installCliToPath,
 } from './services/api';
 import { FileTree } from './components/FileTree';
 import { ModelSelectorModal } from './components/ModelSelectorModal';
+import { ModelBootHUD } from './components/ModelBootHUD';
 import { TerminalPane } from './components/TerminalPane';
 import { DiffReviewModal } from './components/DiffReviewModal';
 import { PlanDrawer } from './components/PlanDrawer';
@@ -60,6 +62,7 @@ import {
   Code2,
   Zap,
   PowerOff,
+  RefreshCw,
 } from 'lucide-react';
 
 export function App() {
@@ -68,6 +71,13 @@ export function App() {
   const [selectedModel, setSelectedModel] = useState<string>('');
   const [systemMemory, setSystemMemory] = useState<SystemMemory | null>(null);
   const [isModelModalOpen, setIsModelModalOpen] = useState(false);
+
+  // LLM Booting / Wake-Up State
+  const [isModelBooting, setIsModelBooting] = useState(false);
+  const [bootProgress, setBootProgress] = useState(0);
+  const [bootStageMessage, setBootStageMessage] = useState('');
+  const [bootTargetModel, setBootTargetModel] = useState('');
+  const [isAutonomousBootTrigger, setIsAutonomousBootTrigger] = useState(false);
 
   // Workspace & File Tree State
   const [workspacePath, setWorkspacePath] = useState<string>(() => {
@@ -295,6 +305,57 @@ export function App() {
       console.error('Failed to offload models:', err);
       showErrorAlert('Offload Failed', err.message || 'Could not offload models from RAM');
     }
+  };
+
+  // LLM Booting Sequence with live HUD progress tracking
+  const runModelBootSequence = async (
+    modelToBoot: string,
+    isAutonomousTrigger = false
+  ): Promise<boolean> => {
+    try {
+      setIsModelBooting(true);
+      setBootTargetModel(modelToBoot);
+      setBootProgress(10);
+      setBootStageMessage(`Preparing to boot ${modelToBoot}...`);
+      setIsAutonomousBootTrigger(isAutonomousTrigger);
+
+      const result = await bootModelStream(modelToBoot, (p) => {
+        setBootProgress(p.percent);
+        setBootStageMessage(p.message);
+      });
+
+      if (result.verified || result.success) {
+        setBootProgress(100);
+        setBootStageMessage(`🎉 Model ${modelToBoot} is online and active in RAM!`);
+        showSuccessToast(`Model ${modelToBoot} is now active in RAM and ready.`);
+        await loadModelsAndHardware();
+        // Give 600ms so user can see 100% completion in HUD
+        await new Promise((r) => setTimeout(r, 600));
+        return true;
+      } else {
+        throw new Error(`Model ${modelToBoot} could not be verified in RAM`);
+      }
+    } catch (err: any) {
+      console.error('Failed to boot model:', err);
+      showErrorAlert('LLM Boot Failed', err.message || 'Could not boot model into RAM');
+      return false;
+    } finally {
+      setIsModelBooting(false);
+      setBootTargetModel('');
+      setBootProgress(0);
+      setBootStageMessage('');
+      setIsAutonomousBootTrigger(false);
+    }
+  };
+
+  // Manual Boot action triggered by user
+  const handleManualBoot = async (modelToBoot: string) => {
+    if (!modelToBoot) {
+      await showWarningAlert('Model Required', 'Please choose a local AI model to boot first.');
+      setIsModelModalOpen(true);
+      return;
+    }
+    await runModelBootSequence(modelToBoot, false);
   };
 
   const loadWorkspace = async (targetPath?: string, restoreSession = false) => {
@@ -1159,6 +1220,30 @@ export function App() {
     thinkingEnabled: boolean
   ) => {
     if (abortControllerRef.current?.signal.aborted) return;
+
+    // Requirement 2: Prompt user if model has not been selected
+    if (!selectedModel) {
+      await showWarningAlert('Model Required', 'Please select a local AI model before executing plan phases.');
+      setIsModelModalOpen(true);
+      return;
+    }
+
+    // Requirement 3: If model is currently launching, do not proceed with execution
+    if (isModelBooting) {
+      showInfoToast(`Please wait: ${selectedModel} is currently booting into RAM. Execution will automatically start once online.`);
+      return;
+    }
+
+    // Requirement 2: If LLM is not fully booted up, do not start execution; boot it first
+    const isModelResident = activeLoadedModels.some((m) => m.name === selectedModel);
+    if (!isModelResident) {
+      const booted = await runModelBootSequence(selectedModel, true);
+      if (!booted) {
+        showErrorAlert('Boot Error', `Cannot start Phase ${plan.phases[phaseIndex]?.number || 1} because ${selectedModel} failed to boot into memory.`);
+        return;
+      }
+    }
+
     if (phaseIndex >= plan.phases.length) {
       setActivePlan({ ...plan, status: 'completed' });
       await runFinalVerification();
@@ -1386,6 +1471,34 @@ Output ONLY the file code inside:
       return;
     }
 
+    // Requirement 3: If model is currently launching, do not proceed with execution
+    if (isModelBooting) {
+      showInfoToast(`Please wait: Model "${selectedModel}" is currently booting into RAM. Execution will automatically begin once online.`);
+      return;
+    }
+
+    // Requirement 2: If LLM is not fully booted up, do not start execution; boot it first
+    const isModelResident = activeLoadedModels.some((m) => m.name === selectedModel);
+    if (!isModelResident) {
+      const bootNoticeId = `boot-notice-${Date.now()}`;
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: bootNoticeId,
+          role: 'assistant',
+          content: `⏳ **Please wait as model is being booted:** Local LLM \`${selectedModel}\` is dormant on disk and is waking up into RAM.\n*Execution of your request has not started yet and will automatically begin once the engine is online.*`,
+          timestamp: Date.now(),
+        },
+      ]);
+
+      const booted = await runModelBootSequence(selectedModel, true);
+      setMessages((prev) => prev.filter((m) => m.id !== bootNoticeId));
+
+      if (!booted) {
+        return;
+      }
+    }
+
     // Check if system is currently paused or interrupted and user inputs input
     if (activePlan && (activePlan.status === 'paused' || activePlan.status === 'interrupted')) {
       const trimmed = prompt.trim();
@@ -1574,6 +1687,27 @@ Output ONLY the file code inside:
               </span>
             )}
           </button>
+
+          {/* Live LLM Booting Status Pill */}
+          {isModelBooting && (
+            <div className="model-booting-pill">
+              <RefreshCw size={13} style={{ animation: 'spin 1s linear infinite' }} />
+              <span>Waking up {bootTargetModel || selectedModel} ({bootProgress}%)</span>
+            </div>
+          )}
+
+          {/* Manual Boot Button if Model is Cold on Disk */}
+          {!isModelBooting && selectedModel && !activeLoadedModels.some((m) => m.name === selectedModel) && (
+            <button
+              className="boot-model-header-btn"
+              onClick={() => handleManualBoot(selectedModel)}
+              title={`Manual Boot: Click to wake up and load "${selectedModel}" into RAM now`}
+            >
+              <Zap size={13} />
+              <span>Boot LLM</span>
+              <span className="cold-badge">Cold</span>
+            </button>
+          )}
 
           {/* Quick Active RAM Indicator & Offload */}
           {activeLoadedModels.length > 0 && (
@@ -1924,6 +2058,48 @@ Output ONLY the file code inside:
           </span>
           <span>Model: <strong>{selectedModel}</strong></span>
           {activeModelObj && <span>Est. RAM: <strong>{activeModelObj.ramEstimate.totalEstimatedGB} GB</strong></span>}
+
+          {/* Status Bar: Live Booting indicator */}
+          {isModelBooting && (
+            <span
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 5,
+                color: '#00f0ff',
+                background: 'rgba(0, 240, 255, 0.1)',
+                padding: '1px 6px',
+                borderRadius: 4,
+                border: '1px solid rgba(0, 240, 255, 0.3)',
+              }}
+            >
+              <RefreshCw size={10} style={{ animation: 'spin 1s linear infinite' }} />
+              <span>Waking up LLM... ({bootProgress}%)</span>
+            </span>
+          )}
+
+          {/* Status Bar: Cold Model button */}
+          {!isModelBooting && !activeModelObj?.isLoadedInRam && selectedModel && (
+            <button
+              onClick={() => handleManualBoot(selectedModel)}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 5,
+                color: '#fbbf24',
+                background: 'rgba(245, 158, 11, 0.1)',
+                padding: '1px 6px',
+                borderRadius: 4,
+                border: '1px solid rgba(245, 158, 11, 0.3)',
+                cursor: 'pointer',
+              }}
+              title="Click to boot this model into RAM"
+            >
+              <Zap size={10} />
+              <span>Cold in SSD (Click to Boot)</span>
+            </button>
+          )}
+
           {activeModelObj?.isLoadedInRam && (
             <span
               style={{
@@ -1972,6 +2148,16 @@ Output ONLY the file code inside:
       </footer>
 
       {/* 4. MODALS */}
+      <ModelBootHUD
+        isOpen={isModelBooting}
+        modelName={bootTargetModel || selectedModel}
+        percent={bootProgress}
+        stageMessage={bootStageMessage}
+        isCompleted={bootProgress === 100}
+        ramEstimate={activeModelObj?.ramEstimate?.totalEstimatedGB}
+        isAutonomousTrigger={isAutonomousBootTrigger}
+      />
+
       <ModelSelectorModal
         isOpen={isModelModalOpen}
         onClose={() => setIsModelModalOpen(false)}

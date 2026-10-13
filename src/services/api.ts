@@ -603,4 +603,156 @@ export async function streamSequentialCommandsLive(
   }
 }
 
+export interface AgentStepCallbacks {
+  onChunk?: (chunk: string, isThinking: boolean) => void;
+  onFileWritten?: (file: any) => void;
+  onCommandStarted?: (cmd: { command: string; cwd: string }) => void;
+  onStdout?: (chunk: string) => void;
+  onStderr?: (chunk: string) => void;
+  onCommandFinished?: (res: { command: string; exitCode: number; success: boolean }) => void;
+  onCommandAudited?: (audit: any) => void;
+  onCwdChanged?: (cwd: { newCwd: string; relativeCwd: string }) => void;
+  onStepCompleted?: (step: {
+    stepIndex: number;
+    actionType: string;
+    isFinished: boolean;
+    summary: string;
+    actionResult?: any;
+    explanation?: string;
+  }) => void;
+  onError?: (error: string) => void;
+}
+
+export async function executeAgentStep(
+  params: {
+    model: string;
+    planPrompt: string;
+    planMarkdown: string;
+    stepIndex: number;
+    completedActions: any[];
+    lastActionResult?: any;
+    additionalUserGuidance?: string[];
+    workspacePath: string;
+    currentCwd: string;
+    thinkingEnabled?: boolean;
+  },
+  callbacks: AgentStepCallbacks,
+  signal?: AbortSignal
+): Promise<{
+  isFinished: boolean;
+  actionType: string;
+  summary: string;
+  actionResult?: any;
+  explanation?: string;
+  accumulatedText: string;
+}> {
+  const res = await fetch(`${API_BASE}/agent/step`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+    signal,
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: 'Failed to execute agent step' }));
+    throw new Error(err.error || 'Failed to execute agent step');
+  }
+
+  if (!res.body) throw new Error('No streaming response body from agent step');
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let accumulatedText = '';
+  let finalStepResult = {
+    isFinished: false,
+    actionType: 'info',
+    summary: '',
+    actionResult: null as any,
+    explanation: '',
+    accumulatedText: '',
+  };
+
+  while (true) {
+    if (signal?.aborted) break;
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const events = buffer.split('\n\n');
+    buffer = events.pop() || '';
+
+    for (const ev of events) {
+      if (!ev.trim() || signal?.aborted) continue;
+      const lines = ev.split('\n');
+      let eventType = 'message';
+      let dataStr = '';
+
+      for (const line of lines) {
+        if (line.startsWith('event: ')) eventType = line.substring(7);
+        if (line.startsWith('data: ')) dataStr = line.substring(6);
+      }
+
+      if (!dataStr) continue;
+
+      try {
+        const parsed = JSON.parse(dataStr);
+        switch (eventType) {
+          case 'chunk':
+            accumulatedText += parsed.chunk || '';
+            callbacks.onChunk?.(parsed.chunk || '', !!parsed.isThinking);
+            break;
+          case 'file_written':
+            callbacks.onFileWritten?.(parsed);
+            break;
+          case 'command_started':
+            callbacks.onCommandStarted?.(parsed);
+            break;
+          case 'command_stdout':
+            callbacks.onStdout?.(parsed.chunk || '');
+            break;
+          case 'command_stderr':
+            callbacks.onStderr?.(parsed.chunk || '');
+            break;
+          case 'command_finished':
+            callbacks.onCommandFinished?.(parsed);
+            break;
+          case 'command_audited':
+            callbacks.onCommandAudited?.(parsed);
+            break;
+          case 'cwd_changed':
+            callbacks.onCwdChanged?.(parsed);
+            break;
+          case 'step_completed':
+            finalStepResult = {
+              isFinished: !!parsed.isFinished,
+              actionType: parsed.actionType || 'info',
+              summary: parsed.summary || '',
+              actionResult: parsed.actionResult,
+              explanation: parsed.explanation || '',
+              accumulatedText,
+            };
+            callbacks.onStepCompleted?.(parsed);
+            break;
+          case 'done':
+            if (parsed.isFinished !== undefined) {
+              finalStepResult.isFinished = parsed.isFinished;
+            }
+            break;
+          case 'error':
+            callbacks.onError?.(parsed.error);
+            throw new Error(parsed.error);
+        }
+      } catch (e: any) {
+        if (e.message && e.message !== 'Unexpected token') {
+          throw e;
+        }
+      }
+    }
+  }
+
+  finalStepResult.accumulatedText = accumulatedText;
+  return finalStepResult;
+}
+
 

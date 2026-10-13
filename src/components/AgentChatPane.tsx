@@ -957,10 +957,10 @@ export const AgentChatPane: React.FC<Props> = ({
             className="ai-textarea"
             placeholder={
               isStreaming
-                ? "Type a command or update to interrupt the AI with new guidance..."
+                ? "AI is working... Type any additional instructions/guidance for the next step..."
                 : activePlan && (activePlan.status === 'paused' || activePlan.status === 'interrupted')
-                ? "Type 'proceed' to resume, or provide updated guidance/instructions to revise..."
-                : "Tell the AI what to build or modify... (it will plan, generate files, and run commands on screen)"
+                ? "Type 'proceed' to resume, or provide updated guidance/instructions..."
+                : "Tell the AI what to build or modify... (it will plan, generate files, and run commands step by step)"
             }
             value={inputPrompt}
             onChange={(e) => setInputPrompt(e.target.value)}
@@ -984,10 +984,10 @@ export const AgentChatPane: React.FC<Props> = ({
                   gap: 6,
                 }}
                 onClick={() => handleSubmit()}
-                title="Interrupt and update AI with typed instructions"
+                title={inputPrompt.trim() ? "Send additional guidance to AI for next step" : "Pause AI execution"}
               >
-                <Pause size={13} />
-                <span>{inputPrompt.trim() ? 'Interrupt & Update' : 'Pause'}</span>
+                {inputPrompt.trim() ? <Send size={13} /> : <Pause size={13} />}
+                <span>{inputPrompt.trim() ? 'Send Guidance' : 'Pause'}</span>
               </button>
               <button
                 className="send-btn"

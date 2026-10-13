@@ -22,10 +22,10 @@ import {
   detectLanguage,
   stopAgentGeneration,
   generateImplementationPlan,
+  executeAgentStep,
   verifyWorkspaceFiles,
   fetchWorkspaceSession,
   saveWorkspaceSession,
-  interruptAgent,
   streamSequentialCommandsLive,
   fetchActiveModels,
   unloadAllModels,
@@ -733,6 +733,17 @@ export function App() {
   };
 
   const abortControllerRef = useRef<AbortController | null>(null);
+  const pendingUserGuidanceRef = useRef<string[]>([]);
+  const isAutonomousLoopPausedRef = useRef<boolean>(false);
+  const activeAutonomousTaskRef = useRef<{
+    prompt: string;
+    planMarkdown: string;
+    planTasks: PlanTask[];
+    stepIndex: number;
+    completedActions: any[];
+    lastActionResult: any;
+    thinkingEnabled: boolean;
+  } | null>(null);
 
   // Stop Generation with SweetAlert2 confirmation
   const handleStopGeneration = async () => {
@@ -743,12 +754,14 @@ export function App() {
       return; // User canceled the stop prompt; continue generating!
     }
 
+    isAutonomousLoopPausedRef.current = true;
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
     }
     await stopAgentGeneration();
     setIsStreaming(false);
+    setActivePlan((prev) => (prev ? { ...prev, status: 'paused' } : null));
     setMessages((prev) =>
       prev.map((m) =>
         m.isStreaming
@@ -765,102 +778,65 @@ export function App() {
 
   // Interrupt Generation or on-screen execution with updated instructions
   const handleInterrupt = async (updateMessage?: string) => {
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-      abortControllerRef.current = null;
-    }
-    await stopAgentGeneration();
-    setIsStreaming(false);
-    setIsQueueRunning(false);
-    setIsQueuePaused(true);
+    // Case 1: Autonomous loop is actively executing and user typed guidance:
+    // Do NOT abort! Queue it so the LLM incorporates it on its next atomic step!
+    if (isStreaming && updateMessage?.trim()) {
+      pendingUserGuidanceRef.current.push(updateMessage.trim());
 
-    if (!updateMessage?.trim()) {
-      setActivePlan((prev) => (prev ? { ...prev, status: 'interrupted' } : null));
-      showSuccessToast('System paused. Type instructions to guide the AI.');
+      const userGuidanceMsgId = `guidance-${Date.now()}`;
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: userGuidanceMsgId,
+          role: 'user',
+          content: `⚡ **[Instruction for Next Step]**\n${updateMessage.trim()}`,
+          timestamp: Date.now(),
+          isInterruption: true,
+        },
+      ]);
+
+      showSuccessToast('Instruction queued! The LLM will incorporate it in the next step.');
       return;
     }
 
-    showSuccessToast('Updating AI plan with your instructions...');
-
-    const interruptMsgId = `interrupt-${Date.now()}`;
-    const reviseAsstMsgId = `asst-revised-${Date.now()}`;
-
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: interruptMsgId,
-        role: 'user',
-        content: `⏸️ **[Interruption & Guidance]**\n${updateMessage}`,
-        timestamp: Date.now(),
-        isInterruption: true,
-      },
-      {
-        id: reviseAsstMsgId,
-        role: 'assistant',
-        content: '🔄 **Auditing interruption and updating plan with new instructions...**',
-        timestamp: Date.now(),
-        isStreaming: true,
-      },
-    ]);
-
-    try {
-      const revised = await interruptAgent({
-        model: selectedModel,
-        workspacePath,
-        currentCwd,
-        interruptionMessage: updateMessage,
-        activePlan,
-        completedPhases: activePlan?.phases.slice(0, activePlan.currentPhaseIndex),
-      });
-
-      if (revised.phases && revised.phases.length > 0) {
-        const updatedPlanState: ActivePlanExecution = {
-          prompt: activePlan?.prompt || updateMessage,
-          phases: revised.phases,
-          currentPhaseIndex: 0,
-          status: 'paused',
-          currentCwd,
-          lastInterruption: {
-            message: updateMessage,
-            timestamp: Date.now(),
-          },
-        };
-
-        setActivePlan(updatedPlanState);
-        setPlanTasks(revised.tasks || []);
-
-        // Open updated plan on Monaco
-        await loadWorkspace();
-        const planFileAbs = `${workspacePath}/IMPLEMENTATION_PLAN.md`;
-        await handleSelectFile(planFileAbs, revised.updatedPlanMarkdown);
-
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === reviseAsstMsgId
-              ? {
-                  ...m,
-                  content: `🔄 **AI has updated the plan based on your guidance!**\n\n*Updated requirements:* "${updateMessage}"\n\n${revised.updatedPlanMarkdown}\n\n---\n*System is paused. Click **Proceed to Phase 1** or type 'proceed' to execute the updated plan.*`,
-                  isStreaming: false,
-                }
-              : m
-          )
-        );
-
-        showSuccessToast('Plan updated with your new instructions!');
+    // Case 2: User clicked Pause (empty updateMessage) while streaming
+    if (isStreaming && !updateMessage?.trim()) {
+      isAutonomousLoopPausedRef.current = true;
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+        abortControllerRef.current = null;
       }
-    } catch (err: any) {
-      showErrorAlert('Interruption Error', err.message || 'Failed to update plan');
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === reviseAsstMsgId
-            ? {
-                ...m,
-                content: `⚠️ Failed to update plan automatically: ${err.message}`,
-                isStreaming: false,
-              }
-            : m
-        )
-      );
+      await stopAgentGeneration();
+      setIsStreaming(false);
+      setIsQueueRunning(false);
+      setIsQueuePaused(true);
+      setActivePlan((prev) => (prev ? { ...prev, status: 'paused' } : null));
+      showInfoToast('Execution paused. Click Proceed or type in chat to continue.');
+      return;
+    }
+
+    // Case 3: System was already paused and user sent input
+    if (!isStreaming && updateMessage?.trim()) {
+      const trimmed = updateMessage.trim();
+      if (/^(proceed|continue|next|go|yes|run|ok|start)\b/i.test(trimmed)) {
+        await handleProceedNextPhase();
+        return;
+      } else {
+        pendingUserGuidanceRef.current.push(trimmed);
+        const userGuidanceMsgId = `guidance-${Date.now()}`;
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: userGuidanceMsgId,
+            role: 'user',
+            content: `⚡ **[Instruction for Next Step]**\n${trimmed}`,
+            timestamp: Date.now(),
+            isInterruption: true,
+          },
+        ]);
+        await handleProceedNextPhase();
+        return;
+      }
     }
   };
 
@@ -1213,6 +1189,252 @@ export function App() {
     }
   };
 
+  // Autonomous Step-by-Step Execution Engine
+  // The LLM scans the workspace files & folders, executes ONE atomic action, rescans disk, and issues the next action
+  const runAutonomousStepByStepLoop = async (
+    planPrompt: string,
+    planMarkdown: string,
+    planTasksList: PlanTask[],
+    thinkingEnabled: boolean,
+    startStepIndex = 1,
+    existingActions: any[] = [],
+    initialLastResult: any = null
+  ) => {
+    if (!selectedModel) {
+      await showWarningAlert('Model Required', 'Please select a local AI model before executing.');
+      setIsModelModalOpen(true);
+      return;
+    }
+
+    if (isModelBooting) {
+      showInfoToast(`Please wait: ${selectedModel} is currently booting into RAM. Execution will automatically start once online.`);
+      return;
+    }
+
+    const isModelResident = activeLoadedModels.some((m) => m.name === selectedModel);
+    if (!isModelResident) {
+      const booted = await runModelBootSequence(selectedModel, true);
+      if (!booted) {
+        showErrorAlert('Boot Error', `Cannot start execution because ${selectedModel} failed to boot into memory.`);
+        return;
+      }
+    }
+
+    isAutonomousLoopPausedRef.current = false;
+    setIsStreaming(true);
+
+    const completedActions = [...existingActions];
+    let lastActionResult = initialLastResult;
+    let stepIndex = startStepIndex;
+    const maxSteps = 30;
+
+    activeAutonomousTaskRef.current = {
+      prompt: planPrompt,
+      planMarkdown,
+      planTasks: planTasksList,
+      stepIndex,
+      completedActions,
+      lastActionResult,
+      thinkingEnabled,
+    };
+
+    try {
+      while (stepIndex <= maxSteps) {
+        if (isAutonomousLoopPausedRef.current) break;
+        if (abortControllerRef.current?.signal.aborted) break;
+
+        // Drain pending user instructions queued while agent was working
+        const currentGuidance = [...pendingUserGuidanceRef.current];
+        pendingUserGuidanceRef.current = [];
+
+        const stepMsgId = `step-${stepIndex}-${Date.now()}`;
+        const guidanceSnippetText =
+          currentGuidance.length > 0
+            ? `\n\n⚡ *Incorporating user instruction:* ${currentGuidance.map((g) => `"${g}"`).join('; ')}`
+            : '';
+
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: stepMsgId,
+            role: 'assistant',
+            content: `🔍 **Step ${stepIndex}: Scanning workspace files & determining next action...**${guidanceSnippetText}`,
+            thinking: '',
+            isStreaming: true,
+            timestamp: Date.now(),
+          },
+        ]);
+
+        const stepController = new AbortController();
+        abortControllerRef.current = stepController;
+
+        const stepResult = await executeAgentStep(
+          {
+            model: selectedModel,
+            planPrompt,
+            planMarkdown,
+            stepIndex,
+            completedActions,
+            lastActionResult,
+            additionalUserGuidance: currentGuidance,
+            workspacePath,
+            currentCwd,
+            thinkingEnabled,
+          },
+          {
+            onChunk: (chunk, isThinking) => {
+              setMessages((prev) =>
+                prev.map((m) => {
+                  if (m.id !== stepMsgId) return m;
+                  if (isThinking) {
+                    return { ...m, thinking: (m.thinking || '') + chunk };
+                  }
+                  return { ...m, content: (m.content || '') + chunk };
+                })
+              );
+            },
+            onFileWritten: async (file) => {
+              await loadWorkspace();
+              handleSelectFile(file.fullPath);
+              showSuccessToast(`Created/Updated ${file.path}`);
+            },
+            onCommandStarted: (cmd) => {
+              setActiveDockTab('runner');
+              setIsQueueRunning(true);
+              setIsQueuePaused(false);
+              const queueItem: LiveCommandQueueItem = {
+                id: `cmd-${Date.now()}`,
+                command: cmd.command,
+                status: 'running',
+                cwd: cmd.cwd,
+                stdout: '',
+                stderr: '',
+                startTime: Date.now(),
+              };
+              setLiveQueue((prev) => [...prev, queueItem]);
+              setCurrentQueueIndex((prev) => prev + 1);
+            },
+            onStdout: (chunk) => {
+              setLiveQueue((prev) => {
+                if (prev.length === 0) return prev;
+                const updated = [...prev];
+                const last = { ...updated[updated.length - 1] };
+                last.stdout += chunk;
+                updated[updated.length - 1] = last;
+                return updated;
+              });
+            },
+            onStderr: (chunk) => {
+              setLiveQueue((prev) => {
+                if (prev.length === 0) return prev;
+                const updated = [...prev];
+                const last = { ...updated[updated.length - 1] };
+                last.stderr += chunk;
+                updated[updated.length - 1] = last;
+                return updated;
+              });
+            },
+            onCommandFinished: (res) => {
+              setLiveQueue((prev) => {
+                if (prev.length === 0) return prev;
+                const updated = [...prev];
+                const last = { ...updated[updated.length - 1] };
+                last.exitCode = res.exitCode;
+                last.status = res.success ? 'completed' : 'error';
+                last.endTime = Date.now();
+                updated[updated.length - 1] = last;
+                return updated;
+              });
+              if (res.success) {
+                showSuccessToast(`Finished: ${res.command}`);
+              } else {
+                showWarningAlert('Command Alert', `Command returned exit code ${res.exitCode}`);
+              }
+            },
+            onCommandAudited: (audit) => {
+              setLiveQueue((prev) => {
+                if (prev.length === 0) return prev;
+                const updated = [...prev];
+                const last = { ...updated[updated.length - 1] };
+                last.audit = audit;
+                updated[updated.length - 1] = last;
+                return updated;
+              });
+            },
+            onCwdChanged: (cwd) => {
+              setCurrentCwd(cwd.newCwd);
+              showInfoToast(`Working directory changed: ${cwd.relativeCwd || cwd.newCwd}`);
+            },
+            onStepCompleted: (step) => {
+              setPlanTasks((prev) => {
+                const nextIncompleteIdx = prev.findIndex((t) => !t.completed);
+                if (nextIncompleteIdx !== -1 && (step.actionType === 'file_written' || step.actionType === 'command' || step.actionType === 'plan_complete')) {
+                  return prev.map((t, i) => (i === nextIncompleteIdx ? { ...t, completed: true } : t));
+                }
+                return prev;
+              });
+            },
+            onError: (err) => {
+              showErrorAlert('Step Execution Error', err);
+            },
+          },
+          stepController.signal
+        );
+
+        if (isAutonomousLoopPausedRef.current || stepController.signal.aborted) {
+          break;
+        }
+
+        completedActions.push({
+          step: stepIndex,
+          type: stepResult.actionType,
+          summary: stepResult.summary,
+          actionResult: stepResult.actionResult,
+        });
+        lastActionResult = stepResult.actionResult || { type: stepResult.actionType, success: true };
+
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === stepMsgId
+              ? {
+                  ...m,
+                  content:
+                    stepResult.isFinished
+                      ? `🎉 **Implementation Completed & Verified!**\n\n${stepResult.summary}\n\n${stepResult.explanation || ''}`
+                      : `✅ **Step ${stepIndex} (${stepResult.actionType}):** ${stepResult.summary}\n\n${stepResult.explanation || ''}`,
+                  isStreaming: false,
+                }
+              : m
+          )
+        );
+
+        if (activeAutonomousTaskRef.current) {
+          activeAutonomousTaskRef.current.stepIndex = stepIndex + 1;
+          activeAutonomousTaskRef.current.completedActions = completedActions;
+          activeAutonomousTaskRef.current.lastActionResult = lastActionResult;
+        }
+
+        if (stepResult.isFinished) {
+          showSuccessToast('All implementation steps completed and verified!');
+          setPlanTasks((prev) => prev.map((t) => ({ ...t, completed: true })));
+          setActivePlan((prev) => (prev ? { ...prev, status: 'completed' } : null));
+          await runFinalVerification();
+          break;
+        }
+
+        stepIndex++;
+        await new Promise((r) => setTimeout(r, 600));
+      }
+    } catch (err: any) {
+      if (err.name !== 'AbortError') {
+        showErrorAlert('Autonomous Loop Error', err.message || String(err));
+      }
+    } finally {
+      setIsStreaming(false);
+      abortControllerRef.current = null;
+    }
+  };
+
   // Helper to execute an individual phase of an active plan
   const executePhase = async (
     plan: ActivePlanExecution,
@@ -1429,8 +1651,23 @@ Output ONLY the file code inside:
     }
   };
 
-  // User proceeds to next phase
+  // User proceeds to next phase or resumes autonomous step loop
   const handleProceedNextPhase = async () => {
+    if (activeAutonomousTaskRef.current) {
+      const task = activeAutonomousTaskRef.current;
+      showSuccessToast(`Resuming Step ${task.stepIndex}...`);
+      setActivePlan((prev) => (prev ? { ...prev, status: 'executing' } : null));
+      await runAutonomousStepByStepLoop(
+        task.prompt,
+        task.planMarkdown,
+        task.planTasks,
+        task.thinkingEnabled,
+        task.stepIndex,
+        task.completedActions,
+        task.lastActionResult
+      );
+      return;
+    }
     if (!activePlan || activePlan.status !== 'paused') return;
     const nextIdx = activePlan.currentPhaseIndex;
     if (nextIdx >= activePlan.phases.length) return;
@@ -1447,8 +1684,13 @@ Output ONLY the file code inside:
     await executePhase(activePlan, nextIdx, true);
   };
 
-  // User skips a phase
+  // User skips a phase or step
   const handleSkipPhase = () => {
+    if (activeAutonomousTaskRef.current) {
+      activeAutonomousTaskRef.current.stepIndex += 1;
+      showSuccessToast(`Skipped to Step ${activeAutonomousTaskRef.current.stepIndex}`);
+      return;
+    }
     if (!activePlan) return;
     const nextIdx = activePlan.currentPhaseIndex + 1;
     if (nextIdx >= activePlan.phases.length) {
@@ -1465,6 +1707,12 @@ Output ONLY the file code inside:
     prompt: string,
     options: { thinkingEnabled: boolean; mode: 'chat' | 'plan' }
   ) => {
+    // If agent is actively streaming / executing, queue this message as guidance for the next step!
+    if (isStreaming) {
+      await handleInterrupt(prompt);
+      return;
+    }
+
     if (!selectedModel) {
       await showWarningAlert('Model Required', 'Please select a local AI model from the top model selector first.');
       setIsModelModalOpen(true);
@@ -1571,16 +1819,16 @@ Output ONLY the file code inside:
         );
       } else {
         // =========================================================================
-        // AUTONOMOUS MULTI-PHASED PIPELINE
+        // AUTONOMOUS STEP-BY-STEP IMPLEMENTATION PIPELINE
         // =========================================================================
-        // Step 1: Prompt LLM to break task into detailed phases & write out on Monaco
+        // Step 1: Prompt LLM to break task into detailed plan & write out on Monaco
         const planMsgId = `plan-msg-${Date.now()}`;
         setMessages((prev) => [
           ...prev,
           {
             id: planMsgId,
             role: 'assistant',
-            content: '📋 **Analyzing requirements and generating Phased Implementation Plan...**',
+            content: '📋 **Analyzing requirements and generating Implementation Plan...**',
             isStreaming: true,
             timestamp: Date.now(),
           },
@@ -1607,24 +1855,29 @@ Output ONLY the file code inside:
             m.id === planMsgId
               ? {
                   ...m,
-                  content: `📋 **Implementation Plan generated!**\n\nThe plan has been written to \`IMPLEMENTATION_PLAN.md\` and opened in Monaco Editor.\n\n${planResult.planMarkdown}\n\n---\n*Starting Phase 1 (${planResult.phases.length} phases total). System will pause after each phase for user review.*`,
+                  content: `📋 **Implementation Plan generated!**\n\nThe plan has been written to \`IMPLEMENTATION_PLAN.md\` and opened in Monaco Editor.\n\n${planResult.planMarkdown}\n\n---\n*Starting Step-by-Step Autonomous Execution... The LLM will inspect files and issue commands/edits step by step.*`,
                   isStreaming: false,
                 }
               : m
           )
         );
 
-        // Step 2: Initialize activePlan state and run Phase 1 (will pause after Phase 1)
+        // Step 2: Initialize activePlan state and run Step-by-Step Autonomous Execution Loop
         const newPlanState: ActivePlanExecution = {
           prompt,
           phases: planResult.phases,
           currentPhaseIndex: 0,
           status: 'executing',
-          autoProceed: false,
+          autoProceed: true,
         };
         setActivePlan(newPlanState);
 
-        await executePhase(newPlanState, 0, options.thinkingEnabled);
+        await runAutonomousStepByStepLoop(
+          prompt,
+          planResult.planMarkdown,
+          planResult.tasks,
+          options.thinkingEnabled
+        );
       }
     } catch (err: any) {
       if (err.name !== 'AbortError') {
@@ -1991,7 +2244,21 @@ Output ONLY the file code inside:
                       prev.map((t) => (t.id === id ? { ...t, completed: !t.completed } : t))
                     );
                   }}
+                  isExecuting={isStreaming}
                   onExecutePlan={() => {
+                    if (activeAutonomousTaskRef.current) {
+                      const task = activeAutonomousTaskRef.current;
+                      runAutonomousStepByStepLoop(
+                        task.prompt,
+                        task.planMarkdown,
+                        task.planTasks,
+                        task.thinkingEnabled,
+                        task.stepIndex,
+                        task.completedActions,
+                        task.lastActionResult
+                      );
+                      return;
+                    }
                     if (activePlan && activePlan.status === 'paused' && activePlan.currentPhaseIndex < activePlan.phases.length) {
                       executePhase(activePlan, activePlan.currentPhaseIndex, true);
                       return;
@@ -1999,7 +2266,7 @@ Output ONLY the file code inside:
                     const incomplete = planTasks.filter((t) => !t.completed);
                     if (incomplete.length > 0) {
                       handleSendMessage(
-                        `Please execute the next step from our plan: "${incomplete[0].title}"`,
+                        `Please execute the steps from our implementation plan`,
                         { thinkingEnabled: true, mode: 'chat' }
                       );
                     }

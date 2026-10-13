@@ -2579,6 +2579,379 @@ app.post('/api/agent/verify', async (req, res) => {
   res.json({ success: true, verified: !hasAnyError, results });
 });
 
+// Endpoint: Autonomous Step-by-Step Execution Engine
+// Analyzes environment, folder contents, past actions & user guidance, then executes next single atomic action
+app.post('/api/agent/step', async (req, res) => {
+  const {
+    model,
+    planPrompt,
+    planMarkdown,
+    stepIndex = 1,
+    completedActions = [],
+    lastActionResult = null,
+    additionalUserGuidance = [],
+    workspacePath,
+    currentCwd,
+    thinkingEnabled = false,
+  } = req.body;
+
+  if (!model || !planPrompt) {
+    return res.status(400).json({ error: 'model and planPrompt are required' });
+  }
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  const sendEvent = (event, data) => {
+    try {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    } catch (e) {}
+  };
+
+  const controller = new AbortController();
+  activeGenerations.add(controller);
+
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      controller.abort();
+    }
+    activeGenerations.delete(controller);
+  });
+
+  try {
+    const targetWorkspace = workspacePath || process.cwd();
+    let activeWorkingDir = currentCwd || workspaceCwdMap.get(targetWorkspace) || targetWorkspace;
+
+    // 1. Live scan of active working directory and whole workspace
+    let cwdEntries = [];
+    try {
+      if (fs.existsSync(activeWorkingDir) && fs.statSync(activeWorkingDir).isDirectory()) {
+        cwdEntries = fs.readdirSync(activeWorkingDir);
+      }
+    } catch (e) {}
+
+    const tree = buildFileTree(targetWorkspace, 0, 2);
+    const fileListSnippet = tree.map((t) => (t.isDirectory ? `📁 ${t.name}/` : `📄 ${t.name}`)).join('\n');
+
+    let manifestInfo = '';
+    const pkgPath = path.join(targetWorkspace, 'package.json');
+    if (fs.existsSync(pkgPath)) {
+      try {
+        const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+        manifestInfo += `\npackage.json dependencies: ${JSON.stringify({ ...pkg.dependencies, ...pkg.devDependencies })}`;
+      } catch (e) {}
+    }
+
+    let ideContextSnippet = '';
+    const ideContextPath = path.join(targetWorkspace, '.ide', 'context.md');
+    if (fs.existsSync(ideContextPath)) {
+      try {
+        ideContextSnippet = `\n--- RECENT WORKSPACE ACTIVITY (.ide) ---\n${fs.readFileSync(ideContextPath, 'utf8').slice(0, 1000)}\n`;
+      } catch (e) {}
+    }
+
+    const guidanceSnippet = Array.isArray(additionalUserGuidance) && additionalUserGuidance.length > 0
+      ? `\n======================================================================
+⚡ HIGH-PRIORITY USER INSTRUCTION RECEIVED DURING EXECUTION:
+${additionalUserGuidance.map((g, i) => `${i + 1}. "${g}"`).join('\n')}
+You MUST incorporate these instructions immediately into your ongoing implementation!
+======================================================================\n`
+      : '';
+
+    const previousActionSnippet = lastActionResult
+      ? `Type: ${lastActionResult.type} | Target: ${lastActionResult.target || lastActionResult.path || lastActionResult.command} | Success: ${lastActionResult.success}
+${lastActionResult.stdout ? `Terminal Stdout:\n${lastActionResult.stdout.slice(0, 600)}\n` : ''}
+${lastActionResult.stderr ? `Terminal Stderr:\n${lastActionResult.stderr.slice(0, 600)}\n` : ''}
+${lastActionResult.filesCreated && lastActionResult.filesCreated.length > 0 ? `Files created/modified: ${lastActionResult.filesCreated.join(', ')}\n` : ''}`
+      : 'Initial step (no previous action executed yet).';
+
+    const completedSummarySnippet = Array.isArray(completedActions) && completedActions.length > 0
+      ? completedActions.map((a, i) => `${i + 1}. [${a.type || 'action'}] ${a.summary || a.command || a.path}`).join('\n')
+      : 'None yet (Starting Step 1).';
+
+    const stepPrompt = `You are the Autonomous Software Engineer of the Aria IDE.
+You are in full control of implementing:
+"${planPrompt}"
+
+IMPLEMENTATION PLAN:
+${planMarkdown ? planMarkdown.slice(0, 2500) : '(No formal plan markdown provided)'}
+
+ACTIONS COMPLETED SO FAR (${completedActions.length}):
+${completedSummarySnippet}
+
+OUTCOME OF PREVIOUS ACTION:
+${previousActionSnippet}
+
+REAL-TIME DISK SCAN (ACTIVE FOLDER & WORKSPACE):
+Active Folder Path: ${activeWorkingDir} (relative: ${path.relative(targetWorkspace, activeWorkingDir) || '.'})
+ITEMS ALREADY IN THIS ACTIVE FOLDER:
+[${cwdEntries.slice(0, 45).join(', ') || 'Empty folder'}]
+Workspace Files:
+${fileListSnippet || '(Empty workspace)'}
+${manifestInfo}
+${ideContextSnippet}
+${guidanceSnippet}
+OPERATIONAL RULES:
+1. Examine what is ALREADY in the folder before issuing any command. Never re-initialize scaffolding if already initialized!
+2. If the previous command had an error (missing dependency, failed build, syntax issue), fix it immediately.
+3. If all files and commands required by the implementation plan have been fully created, tested, and verified, output OPTION 3 (COMPLETE).
+4. Otherwise, choose EXACTLY ONE atomic action to advance the project to the next state:
+
+Option 1 - WRITE OR EDIT A SPECIFIC FILE:
+\`\`\`file:relative/path/to/file.ext
+[complete code here]
+\`\`\`
+
+Option 2 - RUN A TERMINAL COMMAND:
+\`\`\`bash
+command to execute
+\`\`\`
+
+Option 3 - FINISH & COMPLETE IMPLEMENTATION:
+\`\`\`complete
+Summary of what was completed and verified.
+\`\`\`
+
+Explain your reasoning in 1-2 concise sentences, then output the single action block:`;
+
+    sendEvent('status', { status: `LLM analyzing environment for Step ${stepIndex}...` });
+
+    await ensureOnlyTargetModelLoaded(model);
+
+    const ollamaMessages = [
+      { role: 'system', content: 'You are Aria IDE Autonomous Software Engineer. Issue one action at a time and drive the plan step by step.' },
+      { role: 'user', content: stepPrompt },
+    ];
+
+    const ollamaRes = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
+      body: JSON.stringify({
+        model,
+        messages: ollamaMessages,
+        stream: true,
+        keep_alive: '15m',
+        options: {
+          temperature: 0.2,
+          num_predict: 3500,
+          num_ctx: 4096,
+        },
+      }),
+    });
+
+    if (!ollamaRes.ok) {
+      const err = await ollamaRes.text();
+      throw new Error(`Ollama error: ${err}`);
+    }
+
+    const reader = ollamaRes.body.getReader();
+    const decoder = new TextDecoder();
+    let accumulatedContent = '';
+    let accumulatedThinking = '';
+    let inThinkTag = false;
+
+    while (true) {
+      if (controller.signal.aborted) {
+        sendEvent('status', { status: 'Stopped' });
+        break;
+      }
+
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const chunk = decoder.decode(value, { stream: true });
+      const lines = chunk.split('\n').filter((l) => l.trim().length > 0);
+
+      for (const line of lines) {
+        if (controller.signal.aborted) break;
+        try {
+          const parsed = JSON.parse(line);
+          const delta = parsed.message?.content || '';
+
+          if (delta) {
+            accumulatedContent += delta;
+            if (delta.includes('<think>')) inThinkTag = true;
+            if (inThinkTag) accumulatedThinking += delta;
+            if (delta.includes('</think>')) inThinkTag = false;
+
+            sendEvent('chunk', {
+              chunk: delta,
+              isThinking: inThinkTag,
+            });
+          }
+        } catch (e) {}
+      }
+    }
+
+    // Check if task is marked complete
+    const isCompleteBlock =
+      /```complete[\r\n]([\s\S]*?)```/i.test(accumulatedContent) ||
+      accumulatedContent.toLowerCase().includes('```complete') ||
+      (accumulatedContent.toLowerCase().includes('all phases') && accumulatedContent.toLowerCase().includes('completed'));
+
+    if (isCompleteBlock) {
+      const matchSummary = accumulatedContent.match(/```complete[\r\n]([\s\S]*?)```/i);
+      const completionSummary = matchSummary ? matchSummary[1].trim() : 'All implementation plan steps completed and verified.';
+      sendEvent('step_completed', {
+        stepIndex,
+        actionType: 'plan_complete',
+        isFinished: true,
+        summary: completionSummary,
+        explanation: accumulatedContent.replace(/```[\s\S]*?```/g, '').trim(),
+      });
+      sendEvent('done', {
+        isFinished: true,
+        summary: completionSummary,
+      });
+      return res.end();
+    }
+
+    // Extract action blocks from the model response
+    const { fileActions, bashActions } = extractActionsFromText(accumulatedContent, []);
+
+    if (fileActions.length > 0) {
+      const fa = fileActions[0];
+      try {
+        const resWrite = writeWorkspaceFile(targetWorkspace, fa.path, fa.content);
+        appendIdeActivity(targetWorkspace, { type: 'file_written', path: resWrite.relPath, size: resWrite.size });
+        sendEvent('file_written', {
+          path: resWrite.relPath,
+          fullPath: resWrite.absPath,
+          size: resWrite.size,
+          originalContent: resWrite.originalContent,
+          isNewFile: resWrite.isNewFile,
+          content: resWrite.content,
+        });
+
+        sendEvent('step_completed', {
+          stepIndex,
+          actionType: 'file_written',
+          isFinished: false,
+          summary: `Created/updated ${resWrite.relPath} (${resWrite.size} bytes)`,
+          actionResult: {
+            type: 'file_written',
+            target: resWrite.relPath,
+            path: resWrite.relPath,
+            fullPath: resWrite.absPath,
+            size: resWrite.size,
+            success: true,
+          },
+          explanation: accumulatedContent.replace(/```[\s\S]*?```/g, '').trim(),
+        });
+      } catch (fErr) {
+        sendEvent('step_completed', {
+          stepIndex,
+          actionType: 'file_error',
+          isFinished: false,
+          summary: `Failed to write ${fa.path}: ${fErr.message}`,
+          actionResult: {
+            type: 'file_written',
+            target: fa.path,
+            success: false,
+            stderr: fErr.message,
+          },
+        });
+      }
+    } else if (bashActions.length > 0) {
+      const ba = bashActions[0];
+      sendEvent('command_started', { command: ba.command, cwd: activeWorkingDir });
+      const beforeSnap = inspectDirectorySnapshot(activeWorkingDir);
+
+      const resCmd = await executeCommandLiveStream({
+        command: ba.command,
+        cwd: activeWorkingDir,
+        onStdout: (chunk) => sendEvent('command_stdout', { command: ba.command, chunk }),
+        onStderr: (chunk) => sendEvent('command_stderr', { command: ba.command, chunk }),
+        signal: controller.signal,
+      });
+
+      sendEvent('command_finished', { command: ba.command, exitCode: resCmd.exitCode, success: resCmd.success });
+
+      const afterSnap = inspectDirectorySnapshot(activeWorkingDir);
+      const createdDirs = afterSnap.dirs.filter((d) => !beforeSnap.dirs.includes(d));
+      const createdFiles = afterSnap.files.filter((f) => !beforeSnap.files.includes(f));
+
+      const audit = await auditCommandAndStructure({
+        command: ba.command,
+        exitCode: resCmd.exitCode,
+        stdout: resCmd.stdout,
+        stderr: resCmd.stderr,
+        currentCwd: activeWorkingDir,
+        workspacePath: targetWorkspace,
+        createdDirs,
+        createdFiles,
+        model,
+      });
+
+      sendEvent('command_audited', audit);
+      if (audit.newCwd !== activeWorkingDir) {
+        activeWorkingDir = audit.newCwd;
+        workspaceCwdMap.set(targetWorkspace, activeWorkingDir);
+        broadcastToTerminal({ type: 'set_cwd', cwd: activeWorkingDir });
+        sendEvent('cwd_changed', { newCwd: activeWorkingDir, relativeCwd: audit.relativeCwd });
+      }
+
+      appendIdeActivity(targetWorkspace, {
+        type: 'command_audited',
+        command: ba.command,
+        exitCode: resCmd.exitCode,
+        success: resCmd.success,
+        auditSummary: audit.summary,
+        newCwd: audit.relativeCwd,
+      });
+
+      sendEvent('command_executed', { command: ba.command, ...resCmd, audit });
+
+      sendEvent('step_completed', {
+        stepIndex,
+        actionType: 'command',
+        isFinished: false,
+        summary: `Ran "${ba.command}" (exit: ${resCmd.exitCode})`,
+        actionResult: {
+          type: 'command_executed',
+          target: ba.command,
+          command: ba.command,
+          success: resCmd.success,
+          exitCode: resCmd.exitCode,
+          stdout: resCmd.stdout,
+          stderr: resCmd.stderr,
+          filesCreated: createdFiles,
+          dirsCreated: createdDirs,
+        },
+        explanation: accumulatedContent.replace(/```[\s\S]*?```/g, '').trim(),
+      });
+    } else {
+      sendEvent('step_completed', {
+        stepIndex,
+        actionType: 'info',
+        isFinished: false,
+        summary: accumulatedContent.slice(0, 100),
+        actionResult: {
+          type: 'info',
+          target: 'reasoning',
+          success: true,
+        },
+        explanation: accumulatedContent,
+      });
+    }
+
+    sendEvent('done', { isFinished: false });
+    res.end();
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      sendEvent('status', { status: 'Stopped' });
+    } else {
+      sendEvent('error', { error: err.message });
+    }
+    res.end();
+  } finally {
+    activeGenerations.delete(controller);
+  }
+});
+
 // Endpoint: Stream Agent Response & Execute Tools / File Writes in Real-Time
 app.post('/api/agent/stream', async (req, res) => {
     const {
